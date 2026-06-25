@@ -4,6 +4,7 @@ const { getPublicDir } = require('./paths');
 
 const LOGO_DARK_PATH = path.join(getPublicDir(), 'logo-dark.png');
 const LOGO_LIGHT_PATH = path.join(getPublicDir(), 'logo-light.png');
+const PDF_FOOTER_HEIGHT = 32;
 
 function getLogoPath(variant = 'dark') {
   const p = variant === 'light' ? LOGO_LIGHT_PATH : LOGO_DARK_PATH;
@@ -23,20 +24,24 @@ function drawPdfLogo(doc, x, y, size = 42, variant = 'dark') {
   }
 }
 
-/** Draw footer inline after content — avoids orphaning text onto extra pages. */
-function drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName }) {
-  const footerBlockHeight = 22;
-  const pageBottom = doc.page.height - 40;
+function getPdfFooterY(doc) {
+  return doc.page.height - PDF_FOOTER_HEIGHT;
+}
 
-  if (y + footerBlockHeight > pageBottom) {
-    doc.addPage();
-    y = 40;
-  }
+function getPdfContentBottom(doc) {
+  return doc.page.height - PDF_FOOTER_HEIGHT - 14;
+}
+
+/** Draw footer at a fixed position at the bottom of the current page. */
+function drawPdfFooterAtBottom(doc, { left, right, contentWidth, companyName }) {
+  const footerY = getPdfFooterY(doc);
+  const savedY = doc.y;
+  const savedX = doc.x;
 
   doc.strokeColor('#000').fillColor('#000');
-  doc.moveTo(left, y).lineTo(right, y).lineWidth(0.5).stroke();
+  doc.moveTo(left, footerY).lineTo(right, footerY).lineWidth(0.5).stroke();
 
-  const textY = y + 5;
+  const textY = footerY + 5;
   const printedAt = `Printed At: ${new Date().toLocaleString('en-PK')}`;
   const poweredBy = `Powered by ${companyName} Distribution System`;
 
@@ -44,16 +49,39 @@ function drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName })
   doc.text(printedAt, left, textY, { width: contentWidth * 0.55, lineBreak: false });
   doc.text(poweredBy, left, textY, { width: contentWidth, align: 'right', lineBreak: false });
 
-  return y + footerBlockHeight;
+  doc.x = savedX;
+  doc.y = savedY;
+}
+
+/** Stamp fixed footer on every buffered page (call before doc.end()). */
+function stampPdfFootersOnAllPages(doc, footerOpts) {
+  const range = doc.bufferedPageRange();
+  for (let i = 0; i < range.count; i++) {
+    doc.switchToPage(i);
+    drawPdfFooterAtBottom(doc, footerOpts);
+  }
 }
 
 function ensureSpace(doc, y, neededHeight) {
-  const pageBottom = doc.page.height - 50;
+  const pageBottom = getPdfContentBottom(doc);
   if (y + neededHeight > pageBottom) {
     doc.addPage();
     return 40;
   }
   return y;
+}
+
+function buildPdfColumns(left, contentWidth, specs) {
+  const fixedTotal = specs.reduce((sum, col) => sum + (typeof col.w === 'number' ? col.w : 0), 0);
+  const flexCount = specs.filter((col) => col.w === 'flex').length;
+  const flexWidth = flexCount > 0 ? (contentWidth - fixedTotal) / flexCount : 0;
+  let x = left;
+  return specs.map((spec) => {
+    const w = spec.w === 'flex' ? flexWidth : spec.w;
+    const col = { label: spec.label, align: spec.align || 'left', w, x };
+    x += w;
+    return col;
+  });
 }
 
 function drawReportHeader(doc, { company, title, subtitle, left, right, contentWidth }) {
@@ -103,8 +131,11 @@ function drawFilterBox(doc, { left, contentWidth, y, filters }) {
 module.exports = {
   getLogoPath,
   drawPdfLogo,
-  drawPdfFooterInline,
+  drawPdfFooterAtBottom,
+  stampPdfFootersOnAllPages,
+  getPdfContentBottom,
   ensureSpace,
+  buildPdfColumns,
   drawReportHeader,
   drawFilterBox,
 };

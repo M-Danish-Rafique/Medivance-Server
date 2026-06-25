@@ -3,7 +3,10 @@ const router = express.Router();
 const db = require('../config/db');
 const auth = require('../middleware/auth');
 const PDFDocument = require('pdfkit');
-const { drawPdfLogo, drawPdfFooterInline, ensureSpace, drawReportHeader, drawFilterBox } = require('../utils/pdfHelpers');
+const {
+  drawPdfLogo, stampPdfFootersOnAllPages, getPdfContentBottom,
+  ensureSpace, buildPdfColumns, drawReportHeader, drawFilterBox,
+} = require('../utils/pdfHelpers');
 
 // Supplier Ledger
 router.get('/supplier-ledger', auth, async (req, res) => {
@@ -155,7 +158,7 @@ router.get('/customer-ledger/pdf', auth, async (req, res) => {
 });
 
 function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_date, to_date, company }) {
-  const doc = new PDFDocument({ margin: 40, size: 'A4' });
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
   doc.pipe(res);
 
   const companyName = company?.name || 'Medivance';
@@ -234,7 +237,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
     return yy + headerHeight;
   }
 
-  const pageBottom = doc.page.height - 72;
+  const pageBottom = getPdfContentBottom(doc);
 
   // Opening balance shown as the first row of the table
   let runningBalance = openingBalance;
@@ -298,8 +301,8 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
 
   y = doc.y + 12;
 
-  drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName });
-
+  stampPdfFootersOnAllPages(doc, { left, right, contentWidth, companyName });
+  doc.flushPages();
   doc.end();
 }
 
@@ -429,11 +432,14 @@ router.get('/recovery-report/pdf', auth, async (req, res) => {
 });
 
 function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, company }) {
-  const doc = new PDFDocument({ margin: 40, size: 'A4' });
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
   doc.pipe(res);
 
   const companyName = company?.name || 'Medivance';
   const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+  const footerOpts = { left, right, contentWidth, companyName };
+  const fontSize = 9;
+  const headerFontSize = 9.5;
 
   let y = drawReportHeader(doc, {
     company, title: 'SALES REPORT', subtitle: 'Distribution Sales Summary', left, right, contentWidth,
@@ -447,26 +453,24 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
     ],
   });
 
-  const cols = [
-    { label: 'Sr', w: 22 },
-    { label: 'Date', w: 52 },
-    { label: 'Invoice', w: 58 },
-    { label: 'Customer', w: 95 },
-    { label: 'Gross', w: 52, align: 'right' },
-    { label: 'Return', w: 48, align: 'right' },
-    { label: 'Disc.', w: 42, align: 'right' },
-    { label: 'Net', w: 52, align: 'right' },
-    { label: 'Recovered', w: 52, align: 'right' },
-  ];
-  let cx = left;
-  cols.forEach((c) => { c.x = cx; cx += c.w; });
+  const cols = buildPdfColumns(left, contentWidth, [
+    { label: 'Sr', w: 28 },
+    { label: 'Date', w: 64 },
+    { label: 'Invoice', w: 72 },
+    { label: 'Customer', w: 'flex' },
+    { label: 'Gross', w: 62, align: 'right' },
+    { label: 'Return', w: 58, align: 'right' },
+    { label: 'Disc.', w: 52, align: 'right' },
+    { label: 'Net', w: 62, align: 'right' },
+    { label: 'Recovered', w: 62, align: 'right' },
+  ]);
 
-  const rowH = 16, hdrH = 18, pageBottom = doc.page.height - 55;
+  const rowH = 18, hdrH = 20, pageBottom = getPdfContentBottom(doc);
 
   function drawHdr(yy) {
     doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
-    doc.font('Helvetica-Bold').fontSize(7.5).fillColor('#000');
-    cols.forEach((c) => doc.text(c.label, c.x, yy + 4, { width: c.w - 2, align: c.align || 'left', lineBreak: false }));
+    doc.font('Helvetica-Bold').fontSize(headerFontSize).fillColor('#000');
+    cols.forEach((c) => doc.text(c.label, c.x + 2, yy + 5, { width: c.w - 4, align: c.align, lineBreak: false }));
     doc.moveTo(left, yy + hdrH).lineTo(right, yy + hdrH).stroke();
     return yy + hdrH;
   }
@@ -483,41 +487,44 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
     const rec = parseFloat(row.recovered_amount) || 0;
     totals.gross += gross; totals.ret += ret; totals.disc += disc; totals.net += net; totals.rec += rec;
 
-    doc.font('Helvetica').fontSize(7.5);
-    doc.text(String(i + 1), cols[0].x, y + 3, { width: cols[0].w - 2, lineBreak: false });
-    doc.text(new Date(row.date).toLocaleDateString('en-GB'), cols[1].x, y + 3, { width: cols[1].w - 2, lineBreak: false });
-    doc.text(row.invoice_no || '—', cols[2].x, y + 3, { width: cols[2].w - 2, lineBreak: false });
-    doc.text(row.customer_name || '—', cols[3].x, y + 3, { width: cols[3].w - 2, ellipsis: true });
-    doc.text(gross.toFixed(2), cols[4].x, y + 3, { width: cols[4].w - 2, align: 'right', lineBreak: false });
-    doc.text(ret > 0 ? ret.toFixed(2) : '—', cols[5].x, y + 3, { width: cols[5].w - 2, align: 'right', lineBreak: false });
-    doc.text(disc > 0 ? disc.toFixed(2) : '—', cols[6].x, y + 3, { width: cols[6].w - 2, align: 'right', lineBreak: false });
-    doc.text(net.toFixed(2), cols[7].x, y + 3, { width: cols[7].w - 2, align: 'right', lineBreak: false });
-    doc.text(rec > 0 ? rec.toFixed(2) : '—', cols[8].x, y + 3, { width: cols[8].w - 2, align: 'right', lineBreak: false });
+    doc.font('Helvetica').fontSize(fontSize);
+    doc.text(String(i + 1), cols[0].x + 2, y + 4, { width: cols[0].w - 4, lineBreak: false });
+    doc.text(new Date(row.date).toLocaleDateString('en-GB'), cols[1].x + 2, y + 4, { width: cols[1].w - 4, lineBreak: false });
+    doc.text(row.invoice_no || '—', cols[2].x + 2, y + 4, { width: cols[2].w - 4, lineBreak: false });
+    doc.text(row.customer_name || '—', cols[3].x + 2, y + 4, { width: cols[3].w - 4, ellipsis: true });
+    doc.text(gross.toFixed(2), cols[4].x + 2, y + 4, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+    doc.text(ret > 0 ? ret.toFixed(2) : '—', cols[5].x + 2, y + 4, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+    doc.text(disc > 0 ? disc.toFixed(2) : '—', cols[6].x + 2, y + 4, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+    doc.text(net.toFixed(2), cols[7].x + 2, y + 4, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+    doc.text(rec > 0 ? rec.toFixed(2) : '—', cols[8].x + 2, y + 4, { width: cols[8].w - 4, align: 'right', lineBreak: false });
     y += rowH;
   });
 
   doc.moveTo(left, y).lineTo(right, y).stroke();
-  y += 6;
+  y += 8;
   y = ensureSpace(doc, y, 24);
-  doc.font('Helvetica-Bold').fontSize(8);
-  doc.text('TOTAL', cols[3].x, y, { width: cols[3].w, lineBreak: false });
-  doc.text(totals.gross.toFixed(2), cols[4].x, y, { width: cols[4].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.ret.toFixed(2), cols[5].x, y, { width: cols[5].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.disc.toFixed(2), cols[6].x, y, { width: cols[6].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.net.toFixed(2), cols[7].x, y, { width: cols[7].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.rec.toFixed(2), cols[8].x, y, { width: cols[8].w - 2, align: 'right', lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(fontSize);
+  doc.text('TOTAL', cols[3].x + 2, y, { width: cols[3].w - 4, lineBreak: false });
+  doc.text(totals.gross.toFixed(2), cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.ret.toFixed(2), cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.disc.toFixed(2), cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.net.toFixed(2), cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.rec.toFixed(2), cols[8].x + 2, y, { width: cols[8].w - 4, align: 'right', lineBreak: false });
 
-  y += 20;
-  drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName });
+  stampPdfFootersOnAllPages(doc, footerOpts);
+  doc.flushPages();
   doc.end();
 }
 
 function generateRecoveryReportPDF(res, { rows, from_date, to_date, salesmanLabel, supplierLabel, company }) {
-  const doc = new PDFDocument({ margin: 40, size: 'A4' });
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
   doc.pipe(res);
 
   const companyName = company?.name || 'Medivance';
   const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+  const footerOpts = { left, right, contentWidth, companyName };
+  const fontSize = 9;
+  const headerFontSize = 9.5;
 
   let y = drawReportHeader(doc, {
     company, title: 'RECOVERY REPORT', subtitle: 'Recovery & Return Summary', left, right, contentWidth,
@@ -532,24 +539,22 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, salesmanLabe
     ],
   });
 
-  const cols = [
-    { label: 'Sr', w: 24 },
-    { label: 'Date', w: 55 },
-    { label: 'Customer', w: 120 },
-    { label: 'Gross', w: 58, align: 'right' },
-    { label: 'Recovered', w: 58, align: 'right' },
-    { label: 'Ret / Disc', w: 58, align: 'right' },
-    { label: 'Pending', w: 58, align: 'right' },
-  ];
-  let cx = left;
-  cols.forEach((c) => { c.x = cx; cx += c.w; });
+  const cols = buildPdfColumns(left, contentWidth, [
+    { label: 'Sr', w: 28 },
+    { label: 'Date', w: 64 },
+    { label: 'Customer', w: 'flex' },
+    { label: 'Gross', w: 72, align: 'right' },
+    { label: 'Recovered', w: 72, align: 'right' },
+    { label: 'Ret / Disc', w: 72, align: 'right' },
+    { label: 'Pending', w: 72, align: 'right' },
+  ]);
 
-  const rowH = 16, hdrH = 18, pageBottom = doc.page.height - 55;
+  const rowH = 18, hdrH = 20, pageBottom = getPdfContentBottom(doc);
 
   function drawHdr(yy) {
     doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
-    doc.font('Helvetica-Bold').fontSize(7.5).fillColor('#000');
-    cols.forEach((c) => doc.text(c.label, c.x, yy + 4, { width: c.w - 2, align: c.align || 'left', lineBreak: false }));
+    doc.font('Helvetica-Bold').fontSize(headerFontSize).fillColor('#000');
+    cols.forEach((c) => doc.text(c.label, c.x + 2, yy + 5, { width: c.w - 4, align: c.align, lineBreak: false }));
     doc.moveTo(left, yy + hdrH).lineTo(right, yy + hdrH).stroke();
     return yy + hdrH;
   }
@@ -565,29 +570,29 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, salesmanLabe
     const pending = parseFloat(row.net_pending) || 0;
     totals.gross += gross; totals.rec += rec; totals.rd += rd; totals.pending += pending;
 
-    doc.font('Helvetica').fontSize(7.5);
-    doc.text(String(i + 1), cols[0].x, y + 3, { width: cols[0].w - 2, lineBreak: false });
-    doc.text(new Date(row.date).toLocaleDateString('en-GB'), cols[1].x, y + 3, { width: cols[1].w - 2, lineBreak: false });
-    doc.text(row.customer_name || '—', cols[2].x, y + 3, { width: cols[2].w - 2, ellipsis: true });
-    doc.text(gross.toFixed(2), cols[3].x, y + 3, { width: cols[3].w - 2, align: 'right', lineBreak: false });
-    doc.text(rec.toFixed(2), cols[4].x, y + 3, { width: cols[4].w - 2, align: 'right', lineBreak: false });
-    doc.text(rd > 0 ? rd.toFixed(2) : '—', cols[5].x, y + 3, { width: cols[5].w - 2, align: 'right', lineBreak: false });
-    doc.text(pending.toFixed(2), cols[6].x, y + 3, { width: cols[6].w - 2, align: 'right', lineBreak: false });
+    doc.font('Helvetica').fontSize(fontSize);
+    doc.text(String(i + 1), cols[0].x + 2, y + 4, { width: cols[0].w - 4, lineBreak: false });
+    doc.text(new Date(row.date).toLocaleDateString('en-GB'), cols[1].x + 2, y + 4, { width: cols[1].w - 4, lineBreak: false });
+    doc.text(row.customer_name || '—', cols[2].x + 2, y + 4, { width: cols[2].w - 4, ellipsis: true });
+    doc.text(gross.toFixed(2), cols[3].x + 2, y + 4, { width: cols[3].w - 4, align: 'right', lineBreak: false });
+    doc.text(rec.toFixed(2), cols[4].x + 2, y + 4, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+    doc.text(rd > 0 ? rd.toFixed(2) : '—', cols[5].x + 2, y + 4, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+    doc.text(pending.toFixed(2), cols[6].x + 2, y + 4, { width: cols[6].w - 4, align: 'right', lineBreak: false });
     y += rowH;
   });
 
   doc.moveTo(left, y).lineTo(right, y).stroke();
-  y += 6;
+  y += 8;
   y = ensureSpace(doc, y, 24);
-  doc.font('Helvetica-Bold').fontSize(8);
-  doc.text('TOTAL', cols[2].x, y, { width: cols[2].w, lineBreak: false });
-  doc.text(totals.gross.toFixed(2), cols[3].x, y, { width: cols[3].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.rec.toFixed(2), cols[4].x, y, { width: cols[4].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.rd.toFixed(2), cols[5].x, y, { width: cols[5].w - 2, align: 'right', lineBreak: false });
-  doc.text(totals.pending.toFixed(2), cols[6].x, y, { width: cols[6].w - 2, align: 'right', lineBreak: false });
+  doc.font('Helvetica-Bold').fontSize(fontSize);
+  doc.text('TOTAL', cols[2].x + 2, y, { width: cols[2].w - 4, lineBreak: false });
+  doc.text(totals.gross.toFixed(2), cols[3].x + 2, y, { width: cols[3].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.rec.toFixed(2), cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.rd.toFixed(2), cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.pending.toFixed(2), cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
 
-  y += 20;
-  drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName });
+  stampPdfFootersOnAllPages(doc, footerOpts);
+  doc.flushPages();
   doc.end();
 }
 
