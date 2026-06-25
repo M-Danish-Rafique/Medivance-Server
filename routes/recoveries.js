@@ -47,7 +47,7 @@ router.post('/', auth, async (req, res) => {
   const conn = await db.getConnection();
   await conn.beginTransaction();
   try {
-    const { sale_id, salesman_id, date, notes, recovery_items, return_items } = req.body;
+    const { sale_id, salesman_id, date, notes, recovery_items, return_items, amount_recovered } = req.body;
     if (!sale_id || !date) return res.status(400).json({ message: 'Sale and date required' });
 
     const [sRows] = await conn.query('SELECT * FROM sales WHERE id=?', [sale_id]);
@@ -82,13 +82,28 @@ router.post('/', auth, async (req, res) => {
 
     const totalDiscount = (recovery_items || []).reduce((s, i) => s + parseFloat(i.discount_given || 0), 0);
     const totalReturnAmount = allReturnItems.reduce((s, i) => s + parseFloat(i.return_amount || 0), 0);
-    const netCollected = parseFloat(currentSale.total_amount) - totalDiscount - totalReturnAmount;
+    const netCollectible = parseFloat(currentSale.total_amount) - totalDiscount - totalReturnAmount;
+    if (netCollectible < 0) {
+      return res.status(400).json({ message: 'Discount and returns exceed invoice total' });
+    }
+
+    let recoveredAmount = netCollectible;
+    if (amount_recovered !== undefined && amount_recovered !== null && amount_recovered !== '') {
+      recoveredAmount = parseFloat(amount_recovered);
+      if (Number.isNaN(recoveredAmount) || recoveredAmount < 0) {
+        return res.status(400).json({ message: 'Recovered amount must be zero or greater' });
+      }
+      if (recoveredAmount > netCollectible) {
+        return res.status(400).json({ message: `Recovered amount cannot exceed net collectible (${netCollectible.toFixed(2)})` });
+      }
+    }
+    const pendingAmount = netCollectible - recoveredAmount;
 
     // Insert recovery header
     const [result] = await conn.query(
-      `INSERT INTO recoveries (sale_id, salesman_id, date, notes, total_discount, total_return_amount, net_collected)
-       VALUES (?,?,?,?,?,?,?)`,
-      [sale_id, salesman_id || null, date, notes || null, totalDiscount, totalReturnAmount, netCollected]
+      `INSERT INTO recoveries (sale_id, salesman_id, date, notes, total_discount, total_return_amount, net_collectible, net_collected, pending_amount)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [sale_id, salesman_id || null, date, notes || null, totalDiscount, totalReturnAmount, netCollectible, recoveredAmount, pendingAmount]
     );
     const recoveryId = result.insertId;
 
@@ -184,17 +199,19 @@ router.post('/', auth, async (req, res) => {
       }
     }
 
-    // ── Record net cash collected in ledger ─────────────────────────
-    if (netCollected > 0) {
+    // ── Record cash recovered in ledger (partial or full) ───────────
+    if (recoveredAmount > 0) {
       await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
-        [netCollected, currentSale.customer_id]);
+        [recoveredAmount, currentSale.customer_id]);
       const [custRows] = await conn.query('SELECT balance FROM customers WHERE id=?', [currentSale.customer_id]);
+      const payDesc = pendingAmount > 0
+        ? `Cash Collected — Invoice ${currentSale.invoice_no} (Pending: ${pendingAmount.toFixed(2)})${notes ? ' (' + notes + ')' : ''}`
+        : `Cash Collected — Invoice ${currentSale.invoice_no}${notes ? ' (' + notes + ')' : ''}`;
       await conn.query(
         `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
          VALUES (?,?,?,?,?,?,?,?,?)`,
-        [currentSale.customer_id, date, currentSale.invoice_no,
-         `Cash Collected — Invoice ${currentSale.invoice_no}${notes ? ' (' + notes + ')' : ''}`,
-         0, netCollected, custRows[0].balance, 'payment', recoveryId]
+        [currentSale.customer_id, date, currentSale.invoice_no, payDesc,
+         0, recoveredAmount, custRows[0].balance, 'payment', recoveryId]
       );
     }
 
@@ -203,8 +220,14 @@ router.post('/', auth, async (req, res) => {
 
     await conn.commit();
     await logAudit(req, 'CREATE', 'recovery', recoveryId,
-      `Recovery on invoice ${currentSale.invoice_no}: discount ${totalDiscount}, returns ${totalReturnAmount}, collected ${netCollected}`);
-    res.status(201).json({ id: recoveryId, net_collected: netCollected });
+      `Recovery on invoice ${currentSale.invoice_no}: discount ${totalDiscount}, returns ${totalReturnAmount}, recovered ${recoveredAmount}, pending ${pendingAmount}`);
+    res.status(201).json({
+      id: recoveryId,
+      net_collectible: netCollectible,
+      amount_recovered: recoveredAmount,
+      pending_amount: pendingAmount,
+      net_collected: recoveredAmount,
+    });
   } catch (err) {
     await conn.rollback();
     console.error(err);

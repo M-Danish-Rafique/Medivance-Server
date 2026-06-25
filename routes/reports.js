@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require('../config/db');
 const auth = require('../middleware/auth');
 const PDFDocument = require('pdfkit');
-const { drawPdfLogo, drawPdfFooterAtBottom, ensureSpace } = require('../utils/pdfHelpers');
+const { drawPdfLogo, drawPdfFooterInline, ensureSpace, drawReportHeader, drawFilterBox } = require('../utils/pdfHelpers');
 
 // Supplier Ledger
 router.get('/supplier-ledger', auth, async (req, res) => {
@@ -298,8 +298,296 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
 
   y = doc.y + 12;
 
-  drawPdfFooterAtBottom(doc, { left, right, contentWidth, companyName });
+  drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName });
 
+  doc.end();
+}
+
+// ── Sales Report data ───────────────────────────────────────────────────────
+async function fetchSalesReportData({ from_date, to_date, salesman_id }) {
+  let sql = `
+    SELECT s.id, s.date, s.invoice_no, c.name AS customer_name,
+           e.name AS salesman_name,
+           s.total_amount AS gross_amount,
+           COALESCE(r.total_return_amount, 0) AS return_amount,
+           COALESCE(r.total_discount, 0) AS discount,
+           (s.total_amount - COALESCE(r.total_return_amount, 0) - COALESCE(r.total_discount, 0)) AS net_amount,
+           COALESCE(r.net_collected, 0) AS recovered_amount
+    FROM sales s
+    JOIN customers c ON s.customer_id = c.id
+    LEFT JOIN employees e ON s.salesman_id = e.id
+    LEFT JOIN recoveries r ON r.sale_id = s.id
+    WHERE 1=1`;
+  const params = [];
+  if (from_date) { sql += ' AND s.date >= ?'; params.push(from_date); }
+  if (to_date) { sql += ' AND s.date <= ?'; params.push(to_date); }
+  if (salesman_id) { sql += ' AND s.salesman_id = ?'; params.push(salesman_id); }
+  sql += ' ORDER BY s.date ASC, s.id ASC';
+  const [rows] = await db.query(sql, params);
+  return rows;
+}
+
+// ── Recovery Report data ────────────────────────────────────────────────────
+async function fetchRecoveryReportData({ from_date, to_date, salesman_id, supplier_id }) {
+  let sql = `
+    SELECT r.id, r.date, c.name AS customer_name, e.name AS salesman_name,
+           s.invoice_no, s.total_amount AS gross_amount,
+           COALESCE(r.net_collected, 0) AS recovered_amount,
+           (COALESCE(r.total_discount, 0) + COALESCE(r.total_return_amount, 0)) AS return_discount,
+           COALESCE(r.pending_amount,
+             s.total_amount - COALESCE(r.net_collected, 0) - COALESCE(r.total_discount, 0) - COALESCE(r.total_return_amount, 0)
+           ) AS net_pending
+    FROM recoveries r
+    JOIN sales s ON r.sale_id = s.id
+    JOIN customers c ON s.customer_id = c.id
+    LEFT JOIN employees e ON r.salesman_id = e.id
+    WHERE 1=1`;
+  const params = [];
+  if (from_date) { sql += ' AND r.date >= ?'; params.push(from_date); }
+  if (to_date) { sql += ' AND r.date <= ?'; params.push(to_date); }
+  if (salesman_id) { sql += ' AND r.salesman_id = ?'; params.push(salesman_id); }
+  if (supplier_id) {
+    sql += ` AND EXISTS (
+      SELECT 1 FROM sale_items si
+      JOIN supplier_products sp ON sp.product_id = si.product_id
+      WHERE si.sale_id = s.id AND sp.supplier_id = ?
+    )`;
+    params.push(supplier_id);
+  }
+  sql += ' ORDER BY r.date ASC, r.id ASC';
+  const [rows] = await db.query(sql, params);
+  return rows;
+}
+
+router.get('/sales-report', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, salesman_id } = req.query;
+    const rows = await fetchSalesReportData({ from_date, to_date, salesman_id: salesman_id || null });
+    res.json({ rows });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.get('/recovery-report', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, salesman_id, supplier_id } = req.query;
+    const rows = await fetchRecoveryReportData({
+      from_date, to_date,
+      salesman_id: salesman_id || null,
+      supplier_id: supplier_id || null,
+    });
+    res.json({ rows });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.get('/sales-report/pdf', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, salesman_id } = req.query;
+    const rows = await fetchSalesReportData({ from_date, to_date, salesman_id: salesman_id || null });
+    const [[companySettings]] = await db.query('SELECT * FROM company_settings WHERE id=1');
+
+    let salesmanLabel = 'All';
+    if (salesman_id) {
+      const [emp] = await db.query('SELECT name FROM employees WHERE id=?', [salesman_id]);
+      salesmanLabel = emp[0]?.name || salesman_id;
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="sales-report.pdf"');
+
+    generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, company: companySettings });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.get('/recovery-report/pdf', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, salesman_id, supplier_id } = req.query;
+    const rows = await fetchRecoveryReportData({
+      from_date, to_date,
+      salesman_id: salesman_id || null,
+      supplier_id: supplier_id || null,
+    });
+    const [[companySettings]] = await db.query('SELECT * FROM company_settings WHERE id=1');
+
+    let salesmanLabel = 'All';
+    if (salesman_id) {
+      const [emp] = await db.query('SELECT name FROM employees WHERE id=?', [salesman_id]);
+      salesmanLabel = emp[0]?.name || salesman_id;
+    }
+    let supplierLabel = 'All';
+    if (supplier_id) {
+      const [sup] = await db.query('SELECT name FROM suppliers WHERE id=?', [supplier_id]);
+      supplierLabel = sup[0]?.name || supplier_id;
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="recovery-report.pdf"');
+
+    generateRecoveryReportPDF(res, {
+      rows, from_date, to_date, salesmanLabel, supplierLabel, company: companySettings,
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, company }) {
+  const doc = new PDFDocument({ margin: 40, size: 'A4' });
+  doc.pipe(res);
+
+  const companyName = company?.name || 'Medivance';
+  const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+
+  let y = drawReportHeader(doc, {
+    company, title: 'SALES REPORT', subtitle: 'Distribution Sales Summary', left, right, contentWidth,
+  });
+
+  y = drawFilterBox(doc, {
+    left, contentWidth, y,
+    filters: [
+      `Period: ${from_date || 'Beginning'}  to  ${to_date || 'Present'}`,
+      `Salesman: ${salesmanLabel}`,
+    ],
+  });
+
+  const cols = [
+    { label: 'Sr', w: 22 },
+    { label: 'Date', w: 52 },
+    { label: 'Invoice', w: 58 },
+    { label: 'Customer', w: 95 },
+    { label: 'Gross', w: 52, align: 'right' },
+    { label: 'Return', w: 48, align: 'right' },
+    { label: 'Disc.', w: 42, align: 'right' },
+    { label: 'Net', w: 52, align: 'right' },
+    { label: 'Recovered', w: 52, align: 'right' },
+  ];
+  let cx = left;
+  cols.forEach((c) => { c.x = cx; cx += c.w; });
+
+  const rowH = 16, hdrH = 18, pageBottom = doc.page.height - 55;
+
+  function drawHdr(yy) {
+    doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
+    doc.font('Helvetica-Bold').fontSize(7.5).fillColor('#000');
+    cols.forEach((c) => doc.text(c.label, c.x, yy + 4, { width: c.w - 2, align: c.align || 'left', lineBreak: false }));
+    doc.moveTo(left, yy + hdrH).lineTo(right, yy + hdrH).stroke();
+    return yy + hdrH;
+  }
+
+  y = drawHdr(y);
+  let totals = { gross: 0, ret: 0, disc: 0, net: 0, rec: 0 };
+
+  rows.forEach((row, i) => {
+    if (y + rowH > pageBottom) { doc.addPage(); y = 40; y = drawHdr(y); }
+    const gross = parseFloat(row.gross_amount) || 0;
+    const ret = parseFloat(row.return_amount) || 0;
+    const disc = parseFloat(row.discount) || 0;
+    const net = parseFloat(row.net_amount) || 0;
+    const rec = parseFloat(row.recovered_amount) || 0;
+    totals.gross += gross; totals.ret += ret; totals.disc += disc; totals.net += net; totals.rec += rec;
+
+    doc.font('Helvetica').fontSize(7.5);
+    doc.text(String(i + 1), cols[0].x, y + 3, { width: cols[0].w - 2, lineBreak: false });
+    doc.text(new Date(row.date).toLocaleDateString('en-GB'), cols[1].x, y + 3, { width: cols[1].w - 2, lineBreak: false });
+    doc.text(row.invoice_no || '—', cols[2].x, y + 3, { width: cols[2].w - 2, lineBreak: false });
+    doc.text(row.customer_name || '—', cols[3].x, y + 3, { width: cols[3].w - 2, ellipsis: true });
+    doc.text(gross.toFixed(2), cols[4].x, y + 3, { width: cols[4].w - 2, align: 'right', lineBreak: false });
+    doc.text(ret > 0 ? ret.toFixed(2) : '—', cols[5].x, y + 3, { width: cols[5].w - 2, align: 'right', lineBreak: false });
+    doc.text(disc > 0 ? disc.toFixed(2) : '—', cols[6].x, y + 3, { width: cols[6].w - 2, align: 'right', lineBreak: false });
+    doc.text(net.toFixed(2), cols[7].x, y + 3, { width: cols[7].w - 2, align: 'right', lineBreak: false });
+    doc.text(rec > 0 ? rec.toFixed(2) : '—', cols[8].x, y + 3, { width: cols[8].w - 2, align: 'right', lineBreak: false });
+    y += rowH;
+  });
+
+  doc.moveTo(left, y).lineTo(right, y).stroke();
+  y += 6;
+  y = ensureSpace(doc, y, 24);
+  doc.font('Helvetica-Bold').fontSize(8);
+  doc.text('TOTAL', cols[3].x, y, { width: cols[3].w, lineBreak: false });
+  doc.text(totals.gross.toFixed(2), cols[4].x, y, { width: cols[4].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.ret.toFixed(2), cols[5].x, y, { width: cols[5].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.disc.toFixed(2), cols[6].x, y, { width: cols[6].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.net.toFixed(2), cols[7].x, y, { width: cols[7].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.rec.toFixed(2), cols[8].x, y, { width: cols[8].w - 2, align: 'right', lineBreak: false });
+
+  y += 20;
+  drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName });
+  doc.end();
+}
+
+function generateRecoveryReportPDF(res, { rows, from_date, to_date, salesmanLabel, supplierLabel, company }) {
+  const doc = new PDFDocument({ margin: 40, size: 'A4' });
+  doc.pipe(res);
+
+  const companyName = company?.name || 'Medivance';
+  const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+
+  let y = drawReportHeader(doc, {
+    company, title: 'RECOVERY REPORT', subtitle: 'Recovery & Return Summary', left, right, contentWidth,
+  });
+
+  y = drawFilterBox(doc, {
+    left, contentWidth, y,
+    filters: [
+      `Period: ${from_date || 'Beginning'}  to  ${to_date || 'Present'}`,
+      `Salesman: ${salesmanLabel}`,
+      `Supplier: ${supplierLabel}`,
+    ],
+  });
+
+  const cols = [
+    { label: 'Sr', w: 24 },
+    { label: 'Date', w: 55 },
+    { label: 'Customer', w: 120 },
+    { label: 'Gross', w: 58, align: 'right' },
+    { label: 'Recovered', w: 58, align: 'right' },
+    { label: 'Ret / Disc', w: 58, align: 'right' },
+    { label: 'Pending', w: 58, align: 'right' },
+  ];
+  let cx = left;
+  cols.forEach((c) => { c.x = cx; cx += c.w; });
+
+  const rowH = 16, hdrH = 18, pageBottom = doc.page.height - 55;
+
+  function drawHdr(yy) {
+    doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
+    doc.font('Helvetica-Bold').fontSize(7.5).fillColor('#000');
+    cols.forEach((c) => doc.text(c.label, c.x, yy + 4, { width: c.w - 2, align: c.align || 'left', lineBreak: false }));
+    doc.moveTo(left, yy + hdrH).lineTo(right, yy + hdrH).stroke();
+    return yy + hdrH;
+  }
+
+  y = drawHdr(y);
+  let totals = { gross: 0, rec: 0, rd: 0, pending: 0 };
+
+  rows.forEach((row, i) => {
+    if (y + rowH > pageBottom) { doc.addPage(); y = 40; y = drawHdr(y); }
+    const gross = parseFloat(row.gross_amount) || 0;
+    const rec = parseFloat(row.recovered_amount) || 0;
+    const rd = parseFloat(row.return_discount) || 0;
+    const pending = parseFloat(row.net_pending) || 0;
+    totals.gross += gross; totals.rec += rec; totals.rd += rd; totals.pending += pending;
+
+    doc.font('Helvetica').fontSize(7.5);
+    doc.text(String(i + 1), cols[0].x, y + 3, { width: cols[0].w - 2, lineBreak: false });
+    doc.text(new Date(row.date).toLocaleDateString('en-GB'), cols[1].x, y + 3, { width: cols[1].w - 2, lineBreak: false });
+    doc.text(row.customer_name || '—', cols[2].x, y + 3, { width: cols[2].w - 2, ellipsis: true });
+    doc.text(gross.toFixed(2), cols[3].x, y + 3, { width: cols[3].w - 2, align: 'right', lineBreak: false });
+    doc.text(rec.toFixed(2), cols[4].x, y + 3, { width: cols[4].w - 2, align: 'right', lineBreak: false });
+    doc.text(rd > 0 ? rd.toFixed(2) : '—', cols[5].x, y + 3, { width: cols[5].w - 2, align: 'right', lineBreak: false });
+    doc.text(pending.toFixed(2), cols[6].x, y + 3, { width: cols[6].w - 2, align: 'right', lineBreak: false });
+    y += rowH;
+  });
+
+  doc.moveTo(left, y).lineTo(right, y).stroke();
+  y += 6;
+  y = ensureSpace(doc, y, 24);
+  doc.font('Helvetica-Bold').fontSize(8);
+  doc.text('TOTAL', cols[2].x, y, { width: cols[2].w, lineBreak: false });
+  doc.text(totals.gross.toFixed(2), cols[3].x, y, { width: cols[3].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.rec.toFixed(2), cols[4].x, y, { width: cols[4].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.rd.toFixed(2), cols[5].x, y, { width: cols[5].w - 2, align: 'right', lineBreak: false });
+  doc.text(totals.pending.toFixed(2), cols[6].x, y, { width: cols[6].w - 2, align: 'right', lineBreak: false });
+
+  y += 20;
+  drawPdfFooterInline(doc, { left, right, contentWidth, y, companyName });
   doc.end();
 }
 

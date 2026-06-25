@@ -544,17 +544,19 @@ CREATE TABLE `recoveries` (
   `notes`               TEXT          NULL,
   `total_discount`      DECIMAL(12,2) NULL DEFAULT 0.00,
   `total_return_amount` DECIMAL(12,2) NULL DEFAULT 0.00,
-  `net_collected`       DECIMAL(12,2) NULL DEFAULT 0.00,   -- cash received
+  `net_collectible`     DECIMAL(12,2) NULL DEFAULT 0.00,   -- due after discount & returns
+  `net_collected`       DECIMAL(12,2) NULL DEFAULT 0.00,   -- cash actually recovered
+  `pending_amount`      DECIMAL(12,2) NULL DEFAULT 0.00,   -- net_collectible - net_collected
   `created_at`          TIMESTAMP     NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   CONSTRAINT `fk_rec_sale`     FOREIGN KEY (`sale_id`)     REFERENCES `sales`    (`id`),
   CONSTRAINT `fk_rec_salesman` FOREIGN KEY (`salesman_id`) REFERENCES `employees`(`id`) ON DELETE SET NULL
 );
 
-INSERT INTO `recoveries` (`id`, `sale_id`, `salesman_id`, `date`, `total_discount`, `total_return_amount`, `net_collected`) VALUES
-  (1, 1, NULL, '2026-05-18',  200.00, 2300.00,  6700.00),
-  (2, 2, NULL, '2026-05-18',   50.00,    0.00,   400.00),
-  (3, 3, NULL, '2026-05-19', 1000.00,    0.00, 10000.00);
+INSERT INTO `recoveries` (`id`, `sale_id`, `salesman_id`, `date`, `total_discount`, `total_return_amount`, `net_collectible`, `net_collected`, `pending_amount`) VALUES
+  (1, 1, NULL, '2026-05-18',  200.00, 2300.00,  6700.00,  6700.00, 0.00),
+  (2, 2, NULL, '2026-05-18',   50.00,    0.00,   400.00,   400.00, 0.00),
+  (3, 3, NULL, '2026-05-19', 1000.00,    0.00, 10000.00, 10000.00, 0.00);
 
 
 -- -----------------------------------------------------------------------------
