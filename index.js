@@ -7,7 +7,7 @@ const { corsOptions } = require('./config/cors');
 const { getPublicDir } = require('./utils/paths');
 
 const app = express();
-app.use(cors(corsOptions()));
+// app.use(cors(corsOptions()));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -45,16 +45,29 @@ app.use('/api/admin', require('./routes/admin'));
 app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {
   try {
     const db = require('./config/db');
-    const [[{ total_customers }]] = await db.query('SELECT COUNT(*) as total_customers FROM customers');
-    const [[{ total_suppliers }]] = await db.query('SELECT COUNT(*) as total_suppliers FROM suppliers');
-    const [[{ total_products }]] = await db.query('SELECT COUNT(*) as total_products FROM products');
     const [[{ monthly_sales }]] = await db.query("SELECT COALESCE(SUM(total_amount),0) as monthly_sales FROM sales WHERE MONTH(date)=MONTH(CURDATE()) AND YEAR(date)=YEAR(CURDATE())");
     const [[{ monthly_purchases }]] = await db.query("SELECT COALESCE(SUM(total_amount),0) as monthly_purchases FROM purchases WHERE MONTH(date)=MONTH(CURDATE()) AND YEAR(date)=YEAR(CURDATE())");
+    const [[{ today_sale }]] = await db.query("SELECT COALESCE(SUM(total_amount),0) as today_sale FROM sales WHERE date=CURDATE()");
+    const [[{ today_recovery }]] = await db.query("SELECT COALESCE(SUM(net_collected),0) as today_recovery FROM recoveries WHERE date=CURDATE()");
+    const [[{ total_receivable }]] = await db.query("SELECT COALESCE(SUM(balance),0) as total_receivable FROM customers WHERE balance > 0");
+    const [[{ total_payable }]] = await db.query("SELECT COALESCE(SUM(balance),0) as total_payable FROM suppliers WHERE balance > 0");
     const [low_stock] = await db.query('SELECT COUNT(*) as cnt FROM inventory WHERE qty <= low_stock_threshold AND qty > 0');
     const [[{ pending_tax }]] = await db.query('SELECT COALESCE(SUM(tax_amount),0) as pending_tax FROM tax_ledger WHERE submitted_to_fbr=0');
     const [recent_sales] = await db.query(`SELECT s.invoice_no, s.date, s.total_amount, c.name as customer_name FROM sales s JOIN customers c ON s.customer_id=c.id ORDER BY s.date DESC LIMIT 5`);
     const [top_products] = await db.query(`SELECT p.name, SUM(si.qty) as total_qty FROM sale_items si JOIN products p ON si.product_id=p.id GROUP BY p.id, p.name ORDER BY total_qty DESC LIMIT 5`);
-    res.json({ total_customers, total_suppliers, total_products, monthly_sales: parseFloat(monthly_sales), monthly_purchases: parseFloat(monthly_purchases), low_stock_count: low_stock[0].cnt, pending_tax: parseFloat(pending_tax), recent_sales, top_products });
+
+    res.json({
+      monthly_sales: parseFloat(monthly_sales),
+      monthly_purchases: parseFloat(monthly_purchases),
+      today_sale: parseFloat(today_sale),
+      today_recovery: parseFloat(today_recovery),
+      total_receivable: parseFloat(total_receivable),
+      total_payable: parseFloat(total_payable),
+      low_stock_count: low_stock[0].cnt,
+      pending_tax: parseFloat(pending_tax),
+      recent_sales,
+      top_products
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
