@@ -3,7 +3,7 @@
  * Example: https://your-app.vercel.app,http://localhost:3000
  */
 function getAllowedOrigins() {
-  const raw = process.env.CLIENT_URL || 'http://localhost:3000';
+  const raw = process.env.CLIENT_URL || 'https://nuve-care.vercel.app,http://localhost:3000';
   return raw.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
