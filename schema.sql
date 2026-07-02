@@ -233,6 +233,7 @@ CREATE TABLE `products` (
   `volume`          DECIMAL(12,4) NULL,
   `volume_uom_id`   INT           NULL,
   `purchase_rate`   DECIMAL(12,4) NULL DEFAULT 0.0000,
+  `show_purchase_rate` TINYINT(1) NOT NULL DEFAULT 1,
   `sale_rate`       DECIMAL(12,2) NULL DEFAULT 0.00,
   `retail_price`    DECIMAL(12,2) NULL DEFAULT 0.00,   -- MRP printed on pack
   `company_id`      VARCHAR(20)   NULL,
@@ -729,6 +730,7 @@ CREATE TABLE IF NOT EXISTS `user_permissions` (
   `perm_suppliers`          TINYINT(1)  NOT NULL DEFAULT 0,
   -- Distribution
   `perm_purchase`           TINYINT(1)  NOT NULL DEFAULT 0,
+  `perm_view_purchase_rate` TINYINT(1)  NOT NULL DEFAULT 0,
   `perm_sale`               TINYINT(1)  NOT NULL DEFAULT 0,
   `perm_inventory`          TINYINT(1)  NOT NULL DEFAULT 0,
   `perm_recovery`           TINYINT(1)  NOT NULL DEFAULT 0,
@@ -768,7 +770,7 @@ CREATE TABLE IF NOT EXISTS `audit_logs` (
 );
 
 
--- -----------------------------------------------------------------------------
+-- --------------------------------+---------------------------------------------
 --  log_rotation_policy
 --  Single-row admin-defined retention policy.
 -- -----------------------------------------------------------------------------

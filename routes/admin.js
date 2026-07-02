@@ -48,7 +48,7 @@ router.get('/users', auth, adminOnly, async (req, res) => {
       SELECT u.id, u.username, u.full_name, u.role, u.is_active, u.created_at,
              up.perm_companies, up.perm_products, up.perm_employees, up.perm_geography,
              up.perm_customers, up.perm_suppliers,
-             up.perm_purchase, up.perm_sale, up.perm_inventory, up.perm_recovery,
+             up.perm_purchase, up.perm_view_purchase_rate, up.perm_sale, up.perm_inventory, up.perm_recovery,
              up.perm_mfg_products, up.perm_mfg_raw_materials, up.perm_mfg_batches, up.perm_mfg_yields,
              up.perm_finance, up.perm_reports, up.perm_tax_ledger
       FROM users u
@@ -80,16 +80,16 @@ router.post('/users', auth, adminOnly, async (req, res) => {
     await conn.query(
       `INSERT INTO user_permissions (user_id,
          perm_companies, perm_products, perm_employees, perm_geography, perm_customers, perm_suppliers,
-         perm_purchase, perm_sale, perm_inventory, perm_recovery,
+         perm_purchase, perm_view_purchase_rate, perm_sale, perm_inventory, perm_recovery,
          perm_mfg_products, perm_mfg_raw_materials, perm_mfg_batches, perm_mfg_yields,
          perm_finance, perm_reports, perm_tax_ledger)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [userId,
         permissions.perm_companies ? 1 : 0, permissions.perm_products ? 1 : 0,
         permissions.perm_employees ? 1 : 0, permissions.perm_geography ? 1 : 0,
         permissions.perm_customers ? 1 : 0, permissions.perm_suppliers ? 1 : 0,
-        permissions.perm_purchase ? 1 : 0, permissions.perm_sale ? 1 : 0,
-        permissions.perm_inventory ? 1 : 0, permissions.perm_recovery ? 1 : 0,
+        permissions.perm_purchase ? 1 : 0, permissions.perm_view_purchase_rate ? 1 : 0,
+        permissions.perm_sale ? 1 : 0, permissions.perm_inventory ? 1 : 0, permissions.perm_recovery ? 1 : 0,
         permissions.perm_mfg_products ? 1 : 0, permissions.perm_mfg_raw_materials ? 1 : 0,
         permissions.perm_mfg_batches ? 1 : 0, permissions.perm_mfg_yields ? 1 : 0,
         permissions.perm_finance ? 1 : 0, permissions.perm_reports ? 1 : 0,
@@ -132,15 +132,15 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
     await conn.query(
       `INSERT INTO user_permissions (user_id,
          perm_companies, perm_products, perm_employees, perm_geography, perm_customers, perm_suppliers,
-         perm_purchase, perm_sale, perm_inventory, perm_recovery,
+         perm_purchase, perm_view_purchase_rate, perm_sale, perm_inventory, perm_recovery,
          perm_mfg_products, perm_mfg_raw_materials, perm_mfg_batches, perm_mfg_yields,
          perm_finance, perm_reports, perm_tax_ledger)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON DUPLICATE KEY UPDATE
          perm_companies=VALUES(perm_companies), perm_products=VALUES(perm_products),
          perm_employees=VALUES(perm_employees), perm_geography=VALUES(perm_geography),
          perm_customers=VALUES(perm_customers), perm_suppliers=VALUES(perm_suppliers),
-         perm_purchase=VALUES(perm_purchase), perm_sale=VALUES(perm_sale),
+         perm_purchase=VALUES(perm_purchase), perm_view_purchase_rate=VALUES(perm_view_purchase_rate), perm_sale=VALUES(perm_sale),
          perm_inventory=VALUES(perm_inventory), perm_recovery=VALUES(perm_recovery),
          perm_mfg_products=VALUES(perm_mfg_products), perm_mfg_raw_materials=VALUES(perm_mfg_raw_materials),
          perm_mfg_batches=VALUES(perm_mfg_batches), perm_mfg_yields=VALUES(perm_mfg_yields),
@@ -150,8 +150,8 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
         permissions.perm_companies ? 1 : 0, permissions.perm_products ? 1 : 0,
         permissions.perm_employees ? 1 : 0, permissions.perm_geography ? 1 : 0,
         permissions.perm_customers ? 1 : 0, permissions.perm_suppliers ? 1 : 0,
-        permissions.perm_purchase ? 1 : 0, permissions.perm_sale ? 1 : 0,
-        permissions.perm_inventory ? 1 : 0, permissions.perm_recovery ? 1 : 0,
+        permissions.perm_purchase ? 1 : 0, permissions.perm_view_purchase_rate ? 1 : 0,
+        permissions.perm_sale ? 1 : 0, permissions.perm_inventory ? 1 : 0, permissions.perm_recovery ? 1 : 0,
         permissions.perm_mfg_products ? 1 : 0, permissions.perm_mfg_raw_materials ? 1 : 0,
         permissions.perm_mfg_batches ? 1 : 0, permissions.perm_mfg_yields ? 1 : 0,
         permissions.perm_finance ? 1 : 0, permissions.perm_reports ? 1 : 0,

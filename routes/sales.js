@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../config/db');
 const auth = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
+const { canViewPurchaseRate } = require('../utils/purchaseRateAccess');
 
 function getFiscalPrefix(dateValue) {
   const date = dateValue ? new Date(dateValue) : new Date();
@@ -57,7 +58,9 @@ router.get('/history/rates', auth, async (req, res) => {
       'SELECT purchase_rate FROM inventory WHERE product_id=? ORDER BY updated_at DESC LIMIT 1',
       [product_id]
     );
-    res.json({ history: rows, purchase_rate: inv[0]?.purchase_rate || null });
+    const [[product]] = await db.query('SELECT show_purchase_rate FROM products WHERE id=?', [product_id]);
+    const canView = await canViewPurchaseRate(req, db, product || { show_purchase_rate: 1 });
+    res.json({ history: rows, purchase_rate: canView ? inv[0]?.purchase_rate || null : null, purchase_rate_visible: canView });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
