@@ -808,3 +808,82 @@ PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 ALTER TABLE `recoveries`
   ADD COLUMN `net_collectible` DECIMAL(12,2) NULL DEFAULT 0.00 AFTER `total_return_amount`,
   ADD COLUMN `pending_amount`   DECIMAL(12,2) NULL DEFAULT 0.00 AFTER `net_collected`;
+
+
+-- =============================================================================
+--  Partial-payment recovery support
+--  Adds cumulative recovery bookkeeping directly on `sales`, so an invoice can
+--  be LOCKED (line items frozen) after its first recovery event while its
+--  recovery itself stays OPEN until the full amount is collected/returned.
+--  `recoveries` remains a per-event history log (one row per payment/return
+--  installment) — see recoveries.js for how the cumulative figures are kept
+--  in sync with the per-event figures on each save.
+-- =============================================================================
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales' AND COLUMN_NAME='total_discount');
+SET @sql := IF(@col_exists=0,
+  'ALTER TABLE `sales` ADD COLUMN `total_discount` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `is_locked`',
+  'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales' AND COLUMN_NAME='total_return_amount');
+SET @sql := IF(@col_exists=0,
+  'ALTER TABLE `sales` ADD COLUMN `total_return_amount` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `total_discount`',
+  'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales' AND COLUMN_NAME='net_collectible');
+SET @sql := IF(@col_exists=0,
+  'ALTER TABLE `sales` ADD COLUMN `net_collectible` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `total_return_amount`',
+  'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales' AND COLUMN_NAME='total_recovered');
+SET @sql := IF(@col_exists=0,
+  'ALTER TABLE `sales` ADD COLUMN `total_recovered` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `net_collectible`',
+  'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales' AND COLUMN_NAME='pending_amount');
+SET @sql := IF(@col_exists=0,
+  'ALTER TABLE `sales` ADD COLUMN `pending_amount` DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER `total_recovered`',
+  'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales' AND COLUMN_NAME='recovery_status');
+SET @sql := IF(@col_exists=0,
+  "ALTER TABLE `sales` ADD COLUMN `recovery_status` ENUM('pending','completed') NOT NULL DEFAULT 'pending' AFTER `pending_amount`",
+  'SELECT 1');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- Backfill invoices that already went through the OLD one-shot recovery flow
+-- (one `recoveries` row per sale, always fully locked with no partial-payment concept).
+UPDATE `sales` s
+JOIN (
+  SELECT sale_id,
+         SUM(total_discount)      AS td,
+         SUM(total_return_amount) AS tr,
+         SUM(net_collected)       AS nc
+  FROM `recoveries`
+  GROUP BY sale_id
+) r ON r.sale_id = s.id
+SET s.total_discount      = r.td,
+    s.total_return_amount = r.tr,
+    s.total_recovered     = r.nc,
+    s.net_collectible     = s.total_amount - r.td - r.tr,
+    s.pending_amount      = GREATEST(0, (s.total_amount - r.td - r.tr) - r.nc),
+    s.recovery_status     = IF((s.total_amount - r.td - r.tr) - r.nc <= 0.009, 'completed', 'pending')
+WHERE s.total_recovered = 0 AND s.net_collectible = 0;
+
+-- Backfill invoices with no recovery activity yet — nothing collected, everything pending.
+UPDATE `sales` s
+SET s.net_collectible = s.total_amount,
+    s.pending_amount  = s.total_amount,
+    s.recovery_status = 'pending'
+WHERE s.id NOT IN (SELECT DISTINCT sale_id FROM `recoveries`)
+  AND s.net_collectible = 0;

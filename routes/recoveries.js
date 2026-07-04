@@ -8,6 +8,8 @@ router.get('/', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT r.*, s.invoice_no, s.date as sale_date, s.total_amount as invoice_total,
+             s.total_recovered as invoice_total_recovered, s.pending_amount as invoice_pending_amount,
+             s.recovery_status as invoice_recovery_status,
              c.name as customer_name, e.name as salesman_name
       FROM recoveries r
       JOIN sales s ON r.sale_id = s.id
@@ -19,10 +21,47 @@ router.get('/', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── Payment history for a single invoice (used by the "click invoice -> history" UI) ──
+router.get('/history/:saleId', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT r.id, r.date, r.notes, r.total_discount, r.total_return_amount,
+              r.net_collectible, r.net_collected, r.pending_amount, r.created_at,
+              e.name as salesman_name
+       FROM recoveries r
+       LEFT JOIN employees e ON r.salesman_id = e.id
+       WHERE r.sale_id=?
+       ORDER BY r.date ASC, r.id ASC`,
+      [req.params.saleId]
+    );
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Other pending (unpaid) invoices for a customer — used by the "(Other) Pending Invoices" tab ──
+router.get('/pending-invoices/:customerId', auth, async (req, res) => {
+  try {
+    const exclude = req.query.exclude ? parseInt(req.query.exclude) : null;
+    const params = [req.params.customerId];
+    let sql = `
+      SELECT s.id, s.invoice_no, s.date, s.total_amount, s.total_discount,
+             s.total_return_amount, s.net_collectible, s.total_recovered,
+             s.pending_amount, s.recovery_status
+      FROM sales s
+      WHERE s.customer_id=? AND s.recovery_status='pending'`;
+    if (exclude) { sql += ' AND s.id != ?'; params.push(exclude); }
+    sql += ' ORDER BY s.date ASC';
+    const [rows] = await db.query(sql, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 router.get('/:id', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT r.*, s.invoice_no, s.date as sale_date, s.total_amount as invoice_total,
+             s.total_recovered as invoice_total_recovered, s.pending_amount as invoice_pending_amount,
+             s.recovery_status as invoice_recovery_status,
              c.name as customer_name, e.name as salesman_name
       FROM recoveries r
       JOIN sales s ON r.sale_id = s.id
@@ -50,9 +89,15 @@ router.post('/', auth, async (req, res) => {
     const { sale_id, salesman_id, date, notes, recovery_items, return_items, amount_recovered } = req.body;
     if (!sale_id || !date) return res.status(400).json({ message: 'Sale and date required' });
 
-    const [sRows] = await conn.query('SELECT * FROM sales WHERE id=?', [sale_id]);
+    // Lock the sale row for the duration of this transaction to avoid
+    // two simultaneous partial payments racing on the same invoice.
+    const [sRows] = await conn.query('SELECT * FROM sales WHERE id=? FOR UPDATE', [sale_id]);
     if (sRows.length === 0) return res.status(404).json({ message: 'Sale not found' });
     const currentSale = sRows[0];
+
+    if (currentSale.recovery_status === 'completed') {
+      return res.status(400).json({ message: `Invoice ${currentSale.invoice_no} is already fully recovered.` });
+    }
 
     // ── Expiry validation for ALL return items ──────────────────────
     const allReturnItems = return_items || [];
@@ -80,30 +125,52 @@ router.post('/', auth, async (req, res) => {
       }
     }
 
-    const totalDiscount = (recovery_items || []).reduce((s, i) => s + parseFloat(i.discount_given || 0), 0);
-    const totalReturnAmount = allReturnItems.reduce((s, i) => s + parseFloat(i.return_amount || 0), 0);
-    const netCollectible = parseFloat(currentSale.total_amount) - totalDiscount - totalReturnAmount;
+    // ── This event's discount / return amounts (not cumulative) ─────
+    const eventDiscount = (recovery_items || []).reduce((s, i) => s + parseFloat(i.discount_given || 0), 0);
+    const eventReturnAmount = allReturnItems.reduce((s, i) => s + parseFloat(i.return_amount || 0), 0);
+
+    // ── Cumulative figures carried over from prior recovery events on this invoice ──
+    const priorDiscount = parseFloat(currentSale.total_discount || 0);
+    const priorReturn = parseFloat(currentSale.total_return_amount || 0);
+    const priorRecovered = parseFloat(currentSale.total_recovered || 0);
+
+    const newTotalDiscount = priorDiscount + eventDiscount;
+    const newTotalReturn = priorReturn + eventReturnAmount;
+    const netCollectible = parseFloat(currentSale.total_amount) - newTotalDiscount - newTotalReturn;
     if (netCollectible < 0) {
       return res.status(400).json({ message: 'Discount and returns exceed invoice total' });
     }
 
-    let recoveredAmount = netCollectible;
+    const pendingBeforeThisPayment = netCollectible - priorRecovered;
+
+    let recoveredAmount = pendingBeforeThisPayment; // default: settle whatever is still outstanding
     if (amount_recovered !== undefined && amount_recovered !== null && amount_recovered !== '') {
       recoveredAmount = parseFloat(amount_recovered);
       if (Number.isNaN(recoveredAmount) || recoveredAmount < 0) {
         return res.status(400).json({ message: 'Recovered amount must be zero or greater' });
       }
-      if (recoveredAmount > netCollectible) {
-        return res.status(400).json({ message: `Recovered amount cannot exceed net collectible (${netCollectible.toFixed(2)})` });
+      if (recoveredAmount > pendingBeforeThisPayment + 0.009) {
+        return res.status(400).json({ message: `Recovered amount cannot exceed pending balance (${pendingBeforeThisPayment.toFixed(2)})` });
       }
     }
-    const pendingAmount = netCollectible - recoveredAmount;
 
-    // Insert recovery header
+    const newTotalRecovered = priorRecovered + recoveredAmount;
+    const pendingAmount = Math.max(0, netCollectible - newTotalRecovered);
+    // Fully settled once nothing is left to collect — either via full cash recovery
+    // or because discounts/returns brought the net collectible down to zero.
+    const recoveryStatus = pendingAmount <= 0.009 ? 'completed' : 'pending';
+
+    if (!(recovery_items || []).length && !allReturnItems.length && recoveredAmount <= 0) {
+      return res.status(400).json({ message: 'Enter at least one discount, return, or recovered amount' });
+    }
+
+    // Insert this recovery event (kept as permanent payment history for the invoice).
+    // total_discount / total_return_amount / net_collected below describe THIS event only;
+    // net_collectible / pending_amount are the running invoice-level figures right after this event.
     const [result] = await conn.query(
       `INSERT INTO recoveries (sale_id, salesman_id, date, notes, total_discount, total_return_amount, net_collectible, net_collected, pending_amount)
        VALUES (?,?,?,?,?,?,?,?,?)`,
-      [sale_id, salesman_id || null, date, notes || null, totalDiscount, totalReturnAmount, netCollectible, recoveredAmount, pendingAmount]
+      [sale_id, salesman_id || null, date, notes || null, eventDiscount, eventReturnAmount, netCollectible, recoveredAmount, pendingAmount]
     );
     const recoveryId = result.insertId;
 
@@ -118,16 +185,16 @@ router.post('/', auth, async (req, res) => {
     }
 
     // ── Process discount in ledger (explicit row) ──────────────────
-    if (totalDiscount > 0) {
+    if (eventDiscount > 0) {
       await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
-        [totalDiscount, currentSale.customer_id]);
+        [eventDiscount, currentSale.customer_id]);
       const [custAfterDisc] = await conn.query('SELECT balance FROM customers WHERE id=?', [currentSale.customer_id]);
       await conn.query(
         `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
          VALUES (?,?,?,?,?,?,?,?,?)`,
         [currentSale.customer_id, date, currentSale.invoice_no,
          `Discount on Invoice ${currentSale.invoice_no}`,
-         0, totalDiscount, custAfterDisc[0].balance, 'payment', recoveryId]
+         0, eventDiscount, custAfterDisc[0].balance, 'payment', recoveryId]
       );
     }
 
@@ -174,7 +241,12 @@ router.post('/', auth, async (req, res) => {
           // Recalculate source invoice total
           const [newItems] = await conn.query('SELECT SUM(total) as t FROM sale_items WHERE sale_id=?', [item.sale_id]);
           const newSaleTotal = parseFloat(newItems[0].t || 0);
-          await conn.query('UPDATE sales SET total_amount=? WHERE id=?', [newSaleTotal, item.sale_id]);
+          // srcSale is unlocked, meaning no recovery has happened against it yet, so its
+          // net_collectible / pending_amount simply track its (now smaller) invoice total.
+          await conn.query(
+            'UPDATE sales SET total_amount=?, net_collectible=?, pending_amount=? WHERE id=?',
+            [newSaleTotal, newSaleTotal, newSaleTotal, item.sale_id]
+          );
 
           // Adjust source ledger DR entry (reduce it)
           await conn.query(
@@ -199,7 +271,7 @@ router.post('/', auth, async (req, res) => {
       }
     }
 
-    // ── Record cash recovered in ledger (partial or full) ───────────
+    // ── Record cash recovered in ledger (this installment) ───────────
     if (recoveredAmount > 0) {
       await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
         [recoveredAmount, currentSale.customer_id]);
@@ -215,18 +287,28 @@ router.post('/', auth, async (req, res) => {
       );
     }
 
-    // Lock the current invoice
-    await conn.query('UPDATE sales SET is_locked=1 WHERE id=?', [sale_id]);
+    // ── Lock the invoice (no further edits to its line items) and update running totals.
+    //    NOTE: locking the invoice is NOT the same as closing its recovery — recovery_status
+    //    only flips to 'completed' once the full amount has actually been collected/returned.
+    await conn.query(
+      `UPDATE sales
+       SET is_locked=1, total_discount=?, total_return_amount=?, net_collectible=?,
+           total_recovered=?, pending_amount=?, recovery_status=?
+       WHERE id=?`,
+      [newTotalDiscount, newTotalReturn, netCollectible, newTotalRecovered, pendingAmount, recoveryStatus, sale_id]
+    );
 
     await conn.commit();
     await logAudit(req, 'CREATE', 'recovery', recoveryId,
-      `Recovery on invoice ${currentSale.invoice_no}: discount ${totalDiscount}, returns ${totalReturnAmount}, recovered ${recoveredAmount}, pending ${pendingAmount}`);
+      `Recovery on invoice ${currentSale.invoice_no}: discount ${eventDiscount}, returns ${eventReturnAmount}, recovered ${recoveredAmount}, pending ${pendingAmount}, status ${recoveryStatus}`);
     res.status(201).json({
       id: recoveryId,
       net_collectible: netCollectible,
       amount_recovered: recoveredAmount,
+      total_recovered: newTotalRecovered,
       pending_amount: pendingAmount,
       net_collected: recoveredAmount,
+      recovery_status: recoveryStatus,
     });
   } catch (err) {
     await conn.rollback();
