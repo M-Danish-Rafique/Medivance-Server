@@ -228,9 +228,13 @@ router.post('/', auth, async (req, res) => {
         const [siRows] = await conn.query('SELECT * FROM sale_items WHERE id=?', [item.sale_item_id]);
         if (siRows.length > 0) {
           const si = siRows[0];
-          const newQty = parseInt(si.qty) - qtyRet;
+          const newQty = Math.max(0, parseInt(si.qty) - qtyRet);
           if (newQty <= 0) {
-            await conn.query('DELETE FROM sale_items WHERE id=?', [item.sale_item_id]);
+            // Do NOT delete: return_items.sale_item_id (FK, no ON DELETE CASCADE)
+            // already references this row from the INSERT above in this same
+            // transaction, so a delete here would always violate fk_ret_sale_item.
+            // Zero it out instead — preserves history/joins for return_items.
+            await conn.query('UPDATE sale_items SET qty=0, total=0 WHERE id=?', [si.id]);
           } else {
             const discFactor = 1 - parseFloat(si.discount_pct || 0) / 100;
             const taxFactor = 1 + parseFloat(si.tax_pct || 0) / 100;
