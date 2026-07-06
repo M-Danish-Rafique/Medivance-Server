@@ -253,10 +253,23 @@ router.post('/', auth, async (req, res) => {
           );
 
           // Adjust source ledger DR entry (reduce it)
-          await conn.query(
-            'UPDATE customer_ledger SET dr=dr-?, balance=balance-? WHERE reference_type="sale" AND reference_id=?',
-            [retAmt, retAmt, item.sale_id]
+          const [ledgerRows] = await conn.query(
+            'SELECT id, dr, cr FROM customer_ledger WHERE reference_type="sale" AND reference_id=?',
+            [item.sale_id]
           );
+          if (ledgerRows.length > 0) {
+            const ledgerRow = ledgerRows[0];
+            const newDr = parseFloat(ledgerRow.dr) - retAmt;
+            if (newDr <= 0.009 && parseFloat(ledgerRow.cr || 0) <= 0.009) {
+              // Full return: no dr or cr impact remains — drop the entry entirely.
+              await conn.query('DELETE FROM customer_ledger WHERE id=?', [ledgerRow.id]);
+            } else {
+              await conn.query(
+                'UPDATE customer_ledger SET dr=?, balance=balance-? WHERE id=?',
+                [Math.max(0, newDr).toFixed(2), retAmt, ledgerRow.id]
+              );
+            }
+          }
           await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
             [retAmt, srcSale.customer_id]);
         }
