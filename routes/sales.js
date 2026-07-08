@@ -112,9 +112,10 @@ router.post('/', auth, async (req, res) => {
     const total_amount = items.reduce((sum, i) => sum + parseFloat(i.total || 0), 0);
 
     const [result] = await conn.query(
-      'INSERT INTO sales (invoice_no, customer_id, salesman_id, delivery_by, date, total_amount, is_locked) VALUES (?,?,?,?,?,?,0)',
-      [invoice_no, customer_id, salesman_id || null, delivery_by || null, date, total_amount]
+      'INSERT INTO sales (invoice_no, customer_id, salesman_id, delivery_by, date, total_amount, net_collectible, pending_amount, is_locked) VALUES (?,?,?,?,?,?,?,?,0)',
+      [invoice_no, customer_id, salesman_id || null, delivery_by || null, date, total_amount, total_amount, total_amount]
     );
+
     const sId = result.insertId;
 
     for (const item of items) {
@@ -195,8 +196,8 @@ router.put('/:id', auth, async (req, res) => {
     // Insert new items
     const total_amount = items.reduce((sum, i) => sum + parseFloat(i.total || 0), 0);
     await conn.query(
-      'UPDATE sales SET customer_id=?, salesman_id=?, delivery_by=?, date=?, total_amount=? WHERE id=?',
-      [customer_id, salesman_id || null, delivery_by || null, date, total_amount, req.params.id]
+      'UPDATE sales SET customer_id=?, salesman_id=?, delivery_by=?, date=?, total_amount=?, net_collectible=?, pending_amount=? WHERE id=?',
+      [customer_id, salesman_id || null, delivery_by || null, date, total_amount, total_amount, total_amount, req.params.id]
     );
 
     for (const item of items) {
