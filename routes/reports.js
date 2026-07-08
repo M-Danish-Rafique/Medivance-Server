@@ -333,13 +333,18 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
 // ─── Sales report data ────────────────────────────────────────────────────────
 
 async function fetchSalesReportData({ from_date, to_date, salesman_id }) {
+  // NOTE: s.total_amount reflects the invoice's NET value — for invoices that had
+  // a "current invoice" return processed against them (unlocked branch in
+  // recoveries.js), total_amount is recalculated down to what's left after that
+  // return. So total_amount is the correct NET figure, not the gross sale value.
+  // Gross is reconstructed by adding back what was discounted/returned.
   let sql = `
     SELECT s.id, s.date, s.invoice_no, c.name AS customer_name,
            e.name AS salesman_name,
-           s.total_amount AS gross_amount,
+           s.total_amount AS net_amount,
            COALESCE(r.total_return_amount, 0) AS return_amount,
            COALESCE(r.total_discount, 0) AS discount,
-           (s.total_amount - COALESCE(r.total_return_amount, 0) - COALESCE(r.total_discount, 0)) AS net_amount,
+           (s.total_amount + COALESCE(r.total_return_amount, 0) + COALESCE(r.total_discount, 0)) AS gross_amount,
            COALESCE(r.net_collected, 0) AS recovered_amount
     FROM sales s
     JOIN customers c ON s.customer_id = c.id
@@ -358,13 +363,16 @@ async function fetchSalesReportData({ from_date, to_date, salesman_id }) {
 // ─── Recovery report data ─────────────────────────────────────────────────────
 
 async function fetchRecoveryReportData({ from_date, to_date, supplier_id }) {
+  // NOTE: s.total_amount is the invoice's NET value (see fetchSalesReportData
+  // above), so gross here is reconstructed by adding back what was recovered
+  // in cash plus what was given away as discount/return for this recovery event.
   let sql = `
     SELECT
       r.id,
       r.date,
       c.name AS customer_name,
       s.invoice_no,
-      s.total_amount AS gross_amount,
+      (s.total_amount + COALESCE(r.total_return_amount, 0) + COALESCE(r.total_discount, 0)) AS gross_amount,
       COALESCE(r.net_collected, 0) AS recovered_amount,
       (COALESCE(r.total_discount, 0) + COALESCE(r.total_return_amount, 0)) AS return_discount,
       COALESCE(
