@@ -4,6 +4,24 @@ const db = require('../config/db');
 const auth = require('../middleware/auth');
 const { sanitizeInventoryRows } = require('../utils/purchaseRateAccess');
 const { logAudit } = require('../middleware/auditLog');
+const PDFDocument = require('pdfkit');
+const {
+  stampPdfFootersOnAllPages,
+  getPdfContentBottom,
+  ensureSpace,
+  measureRowHeight,
+  buildPdfColumns,
+  drawReportHeader,
+  drawFilterBox,
+} = require('../utils/pdfHelpers');
+
+// ─── Shared PDF constants (matches Ledger/Sales/Recovery report typography) ──
+const TABLE_FONT_SIZE     = 8.5;
+const TABLE_HDR_FONT_SIZE = 8.5;
+const TABLE_HDR_H         = 20;
+const TABLE_MIN_ROW       = 18;
+const TABLE_TOP_PAD       = 4;
+const COMPANY_ROW_H       = 20;
 
 router.get('/', auth, async (req, res) => {
   try {
@@ -56,6 +74,42 @@ router.get('/check-batch', auth, async (req, res) => {
       [product_id, batch_no]
     );
     res.json(rows.length > 0 ? rows[0] : null);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Print Inventory (PDF) — grouped by company (A→Z), then product (A→Z), then batch.
+// Optional company_id restricts the report to a single company's products.
+// Date is not a real filter yet — the report always stamps today's date.
+router.get('/print/pdf', auth, async (req, res) => {
+  try {
+    const { company_id } = req.query;
+
+    let sql = `
+      SELECT i.batch_no, i.qty, i.exp_date,
+             COALESCE(NULLIF(i.retail_price, 0), p.retail_price, 0) AS retail_price,
+             p.name AS product_name, p.pack_size, p.company_id,
+             COALESCE(c.name, 'Unassigned') AS company_name
+      FROM inventory i
+      JOIN products p ON i.product_id = p.id
+      LEFT JOIN companies c ON p.company_id = c.id
+      WHERE 1=1
+    `;
+    const params = [];
+    if (company_id) { sql += ' AND p.company_id = ?'; params.push(company_id); }
+    sql += ' ORDER BY company_name ASC, p.name ASC, i.batch_no ASC';
+
+    const [rows] = await db.query(sql, params);
+    const [[company]] = await db.query('SELECT * FROM company_settings WHERE id=1');
+
+    let companyLabel = 'All Companies';
+    if (company_id) {
+      const [c] = await db.query('SELECT name FROM companies WHERE id=?', [company_id]);
+      companyLabel = c[0]?.name || 'Unknown';
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="inventory-report.pdf"');
+    generateInventoryPDF(res, { rows, companyLabel, company });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -233,5 +287,140 @@ router.put('/:id', auth, async (req, res) => {
     res.status(500).json({ message: err.message });
   }
 });
+
+// ─── generateInventoryPDF ─────────────────────────────────────────────────────
+
+function generateInventoryPDF(res, { rows, companyLabel, company }) {
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
+  doc.pipe(res);
+
+  const companyName = company?.name || 'Medivance';
+  const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+  const footerOpts = { left, right, contentWidth, companyName };
+
+  let y = drawReportHeader(doc, {
+    company, title: 'INVENTORY REPORT', subtitle: 'Current Stock Listing', left, right, contentWidth,
+  });
+
+  y = drawFilterBox(doc, {
+    left, contentWidth, y,
+    filters: [
+      `Company: ${companyLabel}`,
+      `Date: ${new Date().toLocaleDateString('en-GB')}`,
+    ],
+  });
+
+  const cols = buildPdfColumns(left, contentWidth, [
+    { label: 'Product',  w: 'flex' },
+    { label: 'Pack',     w: 55 },
+    { label: 'Batch No', w: 68 },
+    { label: 'Expiry',   w: 62 },
+    { label: 'Retail',   w: 62, align: 'right' },
+    { label: 'Qty',      w: 42, align: 'right' },
+  ]);
+
+  const pageBottom = getPdfContentBottom(doc);
+
+  function drawHdr(yy) {
+    doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
+    doc.font('Helvetica-Bold').fontSize(TABLE_HDR_FONT_SIZE).fillColor('#000');
+    cols.forEach(c =>
+      doc.text(c.label, c.x + 2, yy + TABLE_TOP_PAD, { width: c.w - 4, align: c.align, lineBreak: false })
+    );
+    doc.moveTo(left, yy + TABLE_HDR_H).lineTo(right, yy + TABLE_HDR_H).stroke();
+    return yy + TABLE_HDR_H;
+  }
+
+  // Section separator row — one per company, company names sort ascending (A→Z)
+  // because the SQL query already ORDERs BY company_name ASC.
+  function drawCompanyRow(yy, name) {
+    doc.rect(left, yy, contentWidth, COMPANY_ROW_H).fill('#eef2f7');
+    doc.fillColor('#1e293b').font('Helvetica-Bold').fontSize(9.5)
+      .text(name.toUpperCase(), left + 6, yy + 5, { width: contentWidth - 12, lineBreak: false });
+    doc.fillColor('#000');
+    return yy + COMPANY_ROW_H;
+  }
+
+  y = drawHdr(y);
+
+  if (rows.length === 0) {
+    doc.font('Helvetica').fontSize(9.5).fillColor('#666')
+      .text('No inventory records found for the selected filters.', left, y + 14, { width: contentWidth, align: 'center' });
+    doc.fillColor('#000');
+  }
+
+  let currentCompany = null;
+  let batchCount = 0;
+  let totalQty = 0;
+
+  rows.forEach((row) => {
+    const rowCompany = row.company_name || 'Unassigned';
+
+    if (rowCompany !== currentCompany) {
+      if (y + COMPANY_ROW_H + TABLE_MIN_ROW > pageBottom) {
+        doc.addPage();
+        y = doc.page.margins.top;
+        y = drawHdr(y);
+      }
+      y = drawCompanyRow(y, rowCompany);
+      currentCompany = rowCompany;
+    }
+
+    const qty    = parseFloat(row.qty) || 0;
+    const retail = parseFloat(row.retail_price) || 0;
+    batchCount += 1;
+    totalQty   += qty;
+
+    const productStr = row.product_name || '—';
+    const packStr     = row.pack_size || '—';
+    const batchStr    = row.batch_no || '—';
+    const expStr      = row.exp_date ? new Date(row.exp_date).toLocaleDateString('en-GB') : '—';
+    const retailStr   = retail.toFixed(2);
+    const qtyStr      = String(qty);
+
+    doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
+    const rowH = measureRowHeight(doc, [
+      { text: productStr, width: cols[0].w - 4 },
+      { text: packStr,    width: cols[1].w - 4 },
+      { text: batchStr,   width: cols[2].w - 4 },
+      { text: expStr,     width: cols[3].w - 4 },
+      { text: retailStr,  width: cols[4].w - 4 },
+      { text: qtyStr,     width: cols[5].w - 4 },
+    ], TABLE_MIN_ROW);
+
+    if (y + rowH > pageBottom) {
+      doc.addPage();
+      y = doc.page.margins.top;
+      y = drawHdr(y);
+      y = drawCompanyRow(y, currentCompany); // keep the section context visible after a page break
+    }
+
+    doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
+    doc.text(productStr, cols[0].x + 2, y + TABLE_TOP_PAD, { width: cols[0].w - 4 }); // wraps freely
+    doc.text(packStr,    cols[1].x + 2, y + TABLE_TOP_PAD, { width: cols[1].w - 4, lineBreak: false });
+    doc.text(batchStr,   cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
+    doc.text(expStr,     cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4, lineBreak: false });
+    doc.text(retailStr,  cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+    doc.text(qtyStr,     cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+
+    y += rowH;
+  });
+
+  if (rows.length > 0) {
+    doc.moveTo(left, y).lineTo(right, y).stroke();
+    y += 8;
+    y = ensureSpace(doc, y, 24);
+
+    doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
+    doc.text(`Total Batches: ${batchCount}`, cols[0].x + 2, y, {
+      width: cols[0].w + cols[1].w + cols[2].w + cols[3].w - 4, lineBreak: false,
+    });
+    doc.text(String(totalQty), cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  }
+
+  stampPdfFootersOnAllPages(doc, footerOpts);
+  doc.flushPages();
+  doc.end();
+}
 
 module.exports = router;
