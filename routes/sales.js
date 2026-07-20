@@ -4,11 +4,11 @@ const db = require('../config/db');
 const auth = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
 const { canViewPurchaseRate } = require('../utils/purchaseRateAccess');
+const { yearPKT } = require('../utils/dateUtils');
 
 function getFiscalPrefix(dateValue) {
-  const date = dateValue ? new Date(dateValue) : new Date();
-  if (isNaN(date.getTime())) return 'S' + String(new Date().getFullYear()).slice(-2);
-  const year = date.getFullYear();
+  const year = yearPKT(dateValue || new Date());
+  if (Number.isNaN(year)) return 'S' + String(yearPKT()).slice(-2);
   return `S${String(year).slice(-2)}`;
 }
 

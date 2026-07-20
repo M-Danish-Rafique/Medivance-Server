@@ -2,14 +2,16 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const auth = require('../middleware/auth');
+const { todayPKT } = require('../utils/dateUtils');
 
 // ── Helpers ──────────────────────────────────────────────
 async function generateBatchCode(batchDate) {
-  const date = batchDate ? new Date(batchDate) : new Date();
-  const yy = String(date.getFullYear()).slice(-2);
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const datePrefix = `${yy}${mm}${dd}`;
+  const dateStr =
+    typeof batchDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(batchDate)
+      ? batchDate.slice(0, 10)
+      : todayPKT(batchDate || new Date());
+  const [y, m, d] = dateStr.split('-');
+  const datePrefix = `${y.slice(-2)}${m}${d}`;
   
   // Find the last batch created on this same date
   const [rows] = await db.query(

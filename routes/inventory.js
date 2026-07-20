@@ -14,6 +14,7 @@ const {
   drawReportHeader,
   drawFilterBox,
 } = require('../utils/pdfHelpers');
+const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
 
 // ─── Shared PDF constants (matches Ledger/Sales/Recovery report typography) ──
 const TABLE_FONT_SIZE     = 8.5;
@@ -228,16 +229,14 @@ router.put('/:id', auth, async (req, res) => {
       return res.status(400).json({ message: 'Qty must not be less than 0' });
     }
 
-    // ---- Rule 3: exp_date must not be within 3 months of today ----
+    // ---- Rule 3: exp_date must not be within 3 months of today (PKT) ----
     if (exp_date) {
-      const minExp = new Date();
-      minExp.setHours(0, 0, 0, 0);
-      minExp.setMonth(minExp.getMonth() + 3);
-      const newExp = new Date(exp_date);
-      if (isNaN(newExp.getTime())) {
+      const minExpStr = addMonthsPKT(todayPKT(), 3);
+      const expStr = String(exp_date).slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(expStr)) {
         return res.status(400).json({ message: 'Invalid Expiry Date' });
       }
-      if (newExp < minExp) {
+      if (expStr < minExpStr) {
         return res.status(400).json({ message: 'Expiry Date must be more than 3 months from today' });
       }
     }
@@ -306,7 +305,7 @@ function generateInventoryPDF(res, { rows, companyLabel, company }) {
     left, contentWidth, y,
     filters: [
       `Company: ${companyLabel}`,
-      `Date: ${new Date().toLocaleDateString('en-GB')}`,
+      `Date: ${formatDatePKT(new Date())}`,
     ],
   });
 
@@ -374,7 +373,7 @@ function generateInventoryPDF(res, { rows, companyLabel, company }) {
     const productStr = row.product_name || '—';
     const packStr     = row.pack_size || '—';
     const batchStr    = row.batch_no || '—';
-    const expStr      = row.exp_date ? new Date(row.exp_date).toLocaleDateString('en-GB') : '—';
+    const expStr      = row.exp_date ? formatDatePKT(row.exp_date) : '—';
     const retailStr   = retail.toFixed(2);
     const qtyStr      = String(qty);
 

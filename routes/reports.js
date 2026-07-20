@@ -13,6 +13,7 @@ const {
   drawReportHeader,
   drawFilterBox,
 } = require('../utils/pdfHelpers');
+const { formatDatePKT } = require('../utils/dateUtils');
 
 // ─── Shared PDF constants ─────────────────────────────────────────────────────
 //
@@ -187,7 +188,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
 
   doc.font('Helvetica-Bold').fontSize(15).text('LEDGER STATEMENT', left, 40, { width: contentWidth, align: 'right', lineBreak: false });
   doc.font('Helvetica').fontSize(9).text(`${type} Account`, left, doc.y + 2, { width: contentWidth, align: 'right', lineBreak: false });
-  doc.font('Helvetica').fontSize(8).text(`Generated: ${new Date().toLocaleDateString('en-GB')}`, left, doc.y + 2, { width: contentWidth, align: 'right', lineBreak: false });
+  doc.font('Helvetica').fontSize(8).text(`Generated: ${formatDatePKT(new Date())}`, left, doc.y + 2, { width: contentWidth, align: 'right', lineBreak: false });
   doc.fillColor('#000');
 
   let y = Math.max(headerY, doc.y) + 14;
@@ -269,7 +270,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
     totalDr += dr;
     totalCr += cr;
 
-    const dateStr    = new Date(row.date).toLocaleDateString('en-GB');
+    const dateStr    = formatDatePKT(row.date);
     const invoiceStr = row.invoice_no  || '—';
     const descStr    = row.description || '—';
     const drStr      = dr > 0 ? dr.toFixed(2) : '—';
@@ -533,7 +534,7 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
     totals.net   += net;   totals.rec += rec;
 
     const srStr      = String(i + 1);
-    const dateStr    = new Date(row.date).toLocaleDateString('en-GB');
+    const dateStr    = formatDatePKT(row.date);
     const invoiceStr = row.invoice_no    || '—';
     const custStr    = row.customer_name || '—';
     const grossStr   = gross.toFixed(2);
@@ -643,7 +644,7 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
     totals.gross += gross; totals.rec += rec; totals.rd += rd; totals.pending += pending;
 
     const srStr      = String(i + 1);
-    const dateStr    = new Date(row.date).toLocaleDateString('en-GB');
+    const dateStr    = formatDatePKT(row.date);
     const custStr    = row.customer_name || '—';
     const grossStr   = gross.toFixed(2);
     const recStr     = rec.toFixed(2);

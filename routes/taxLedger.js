@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
 const auth = require('../middleware/auth');
+const { todayPKT } = require('../utils/dateUtils');
 
 // Get tax ledger with filters
 router.get('/', auth, async (req, res) => {
@@ -41,7 +42,7 @@ router.post('/submit-fbr', auth, async (req, res) => {
     if (!ids || !ids.length) return res.status(400).json({ message: 'No IDs provided' });
     await db.query(
       'UPDATE tax_ledger SET submitted_to_fbr=1, fbr_submission_date=? WHERE id IN (?)',
-      [submission_date || new Date().toISOString().split('T')[0], ids]
+      [submission_date || todayPKT(), ids]
     );
     res.json({ message: `${ids.length} records marked as submitted` });
   } catch (err) { res.status(500).json({ message: err.message }); }

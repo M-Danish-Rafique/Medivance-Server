@@ -1,6 +1,7 @@
 const path = require('path');
 const fs   = require('fs');
 const { getPublicDir } = require('./paths');
+const { formatDatePKT, formatDateTimePKT } = require('./dateUtils');
 
 const LOGO_DARK_PATH  = path.join(getPublicDir(), 'logo-dark.png');
 const LOGO_LIGHT_PATH = path.join(getPublicDir(), 'logo-light.png');
@@ -110,7 +111,7 @@ function drawPdfFooterAtBottom(doc, { left, right, contentWidth, companyName }) 
     .lineWidth(0.5)
     .stroke();
 
-  const printedAt = `Printed At: ${new Date().toLocaleString('en-PK')}`;
+  const printedAt = `Printed At: ${formatDateTimePKT(new Date())}`;
   const poweredBy = `Powered by ${companyName} Distribution System`;
 
   doc.font('Helvetica').fontSize(7.5).fillColor('#444');
@@ -212,7 +213,7 @@ function drawReportHeader(doc, { company, title, subtitle, left, right, contentW
     doc.font('Helvetica').fontSize(9).text(subtitle, left, doc.y + 2, { width: contentWidth, align: 'right', lineBreak: false });
   }
   doc.font('Helvetica').fontSize(8).text(
-    `Generated: ${new Date().toLocaleDateString('en-GB')}`,
+    `Generated: ${formatDatePKT(new Date())}`,
     left, doc.y + 2,
     { width: contentWidth, align: 'right', lineBreak: false }
   );

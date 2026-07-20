@@ -1,15 +1,5 @@
 const db = require('../config/db');
-
-/**
- * Returns the current time as a MySQL DATETIME string in Pakistan Standard
- * Time (PKT, UTC+5, no DST), regardless of the server's local timezone.
- */
-function nowPKT() {
-  const now = new Date();
-  const utcMs = now.getTime() + now.getTimezoneOffset() * 60000; // shift to true UTC
-  const pkt = new Date(utcMs + 5 * 60 * 60 * 1000); // PKT = UTC+5
-  return pkt.toISOString().slice(0, 19).replace('T', ' ');
-}
+const { nowPKT } = require('../utils/dateUtils');
 
 /**
  * Check whether audit logging is currently enabled (master switch).

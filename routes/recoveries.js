@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../config/db');
 const auth = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
+const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
 
 router.get('/', auth, async (req, res) => {
   try {
@@ -109,17 +110,14 @@ router.post('/', auth, async (req, res) => {
         [item.product_id, item.batch_no]
       );
       if (invRows.length > 0 && invRows[0].exp_date) {
-        const expiry = new Date(invRows[0].exp_date);
-        const now = new Date();
-        // 5 months before expiry threshold
-        const threshold = new Date(expiry);
-        threshold.setMonth(threshold.getMonth() - 5);
-        if (now > threshold) {
+        const expiryStr = String(invRows[0].exp_date).slice(0, 10);
+        const threshold = addMonthsPKT(expiryStr, -5);
+        if (todayPKT() > threshold) {
           // Get product name for error message
           const [pRows] = await conn.query('SELECT name FROM products WHERE id=?', [item.product_id]);
           const pName = pRows[0]?.name || `Product ID ${item.product_id}`;
           return res.status(400).json({
-            message: `Return not allowed for "${pName}" (Batch: ${item.batch_no}). Product expires ${expiry.toLocaleDateString('en-GB')} — within 5 months of expiry. Return window has passed.`
+            message: `Return not allowed for "${pName}" (Batch: ${item.batch_no}). Product expires ${formatDatePKT(expiryStr)} — within 5 months of expiry. Return window has passed.`
           });
         }
       }

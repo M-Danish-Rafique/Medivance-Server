@@ -29,13 +29,22 @@ function getPoolConfig() {
 
 const poolConfig = getPoolConfig();
 
+// PKT = UTC+5 year-round (Asia/Karachi has no DST).
+// mysql2 `timezone` only affects JS Date conversion — CURDATE()/NOW() use the
+// MySQL session time_zone, so we set that on every pooled connection.
+const PKT_OFFSET = '+05:00';
+
 const pool = mysql.createPool({
   ...poolConfig,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  timezone: '+00:00',
+  timezone: PKT_OFFSET,
   ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+});
+
+pool.on('connection', (connection) => {
+  connection.query(`SET time_zone = '${PKT_OFFSET}'`);
 });
 
 module.exports = pool;
