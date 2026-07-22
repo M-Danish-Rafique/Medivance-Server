@@ -101,6 +101,11 @@ router.post('/', auth, async (req, res) => {
     }
 
     // ── Expiry validation for ALL return items ──────────────────────
+    // Admins are allowed to push through a return that falls inside the normal
+    // 5-month return window (they just get a warning back), but even admins
+    // cannot return a batch that has actually passed its expiry month.
+    const isAdmin = req.user?.role === 'admin';
+    const expiryWarnings = [];
     const allReturnItems = return_items || [];
     for (const item of allReturnItems) {
       if (!item.qty_returned || parseInt(item.qty_returned) <= 0) continue;
@@ -113,12 +118,33 @@ router.post('/', auth, async (req, res) => {
         const expiryStr = String(invRows[0].exp_date).slice(0, 10);
         const threshold = addMonthsPKT(expiryStr, -5);
         if (todayPKT() > threshold) {
-          // Get product name for error message
+          // Get product name for the warning/error message
           const [pRows] = await conn.query('SELECT name FROM products WHERE id=?', [item.product_id]);
           const pName = pRows[0]?.name || `Product ID ${item.product_id}`;
-          return res.status(400).json({
-            message: `Return not allowed for "${pName}" (Batch: ${item.batch_no}). Product expires ${formatDatePKT(expiryStr)} — within 5 months of expiry. Return window has passed.`
-          });
+
+          // Compare year-month only (day of month is ignored) to decide whether
+          // the batch has actually expired, e.g. exp July 2026 + today July 2026 => not expired yet.
+          const todayYearMonth = todayPKT().slice(0, 7);
+          const expiryYearMonth = expiryStr.slice(0, 7);
+          const isExpired = todayYearMonth > expiryYearMonth;
+
+          if (isExpired) {
+            // Past actual expiry — blocked for everyone, admin included.
+            return res.status(400).json({
+              message: `Return not allowed for "${pName}" (Batch: ${item.batch_no}). Product expired ${formatDatePKT(expiryStr)}.`
+            });
+          }
+
+          if (!isAdmin) {
+            return res.status(400).json({
+              message: `Return not allowed for "${pName}" (Batch: ${item.batch_no}). Product expires ${formatDatePKT(expiryStr)} — within 5 months of expiry. Return window has passed.`
+            });
+          }
+
+          // Admin, not yet expired, but inside the 5-month window: allow, just warn.
+          expiryWarnings.push(
+            `"${pName}" (Batch: ${item.batch_no}) expires ${formatDatePKT(expiryStr)} — within 5 months of expiry. Returned anyway (admin override).`
+          );
         }
       }
     }
@@ -324,6 +350,7 @@ router.post('/', auth, async (req, res) => {
       pending_amount: pendingAmount,
       net_collected: recoveredAmount,
       recovery_status: recoveryStatus,
+      expiry_warnings: expiryWarnings.length ? expiryWarnings : undefined,
     });
   } catch (err) {
     await conn.rollback();
