@@ -24,6 +24,35 @@ const TABLE_MIN_ROW       = 18;
 const TABLE_TOP_PAD       = 4;
 const COMPANY_ROW_H       = 20;
 
+// ─── Active-batch helpers ─────────────────────────────────────────────────
+// "Active" batch = qty > 0 AND not expired.
+// Expiry is judged by YEAR+MONTH only (never the day-of-month), per business
+// rule: a batch expiring anytime in the current month is still valid; it only
+// becomes invalid once the calendar rolls into the following month (PKT).
+function toYearMonth(dateVal) {
+  if (!dateVal) return null;
+  if (dateVal instanceof Date) {
+    // DATE columns come back as JS Date objects from mysql2 — read the UTC
+    // fields since the driver stores calendar dates at UTC midnight and a
+    // local getMonth()/getDate() could roll the date backward/forward a day.
+    const y = dateVal.getUTCFullYear();
+    const m = String(dateVal.getUTCMonth() + 1).padStart(2, '0');
+    return `${y}-${m}`;
+  }
+  return String(dateVal).slice(0, 7); // 'YYYY-MM-DD...' -> 'YYYY-MM'
+}
+
+function isBatchExpired(expDate) {
+  if (!expDate) return false; // no expiry recorded — treat as not expired
+  const expYM = toYearMonth(expDate);
+  const todayYM = todayPKT().slice(0, 7);
+  return expYM < todayYM;
+}
+
+function isBatchActive(row) {
+  return parseFloat(row.qty) > 0 && !isBatchExpired(row.exp_date);
+}
+
 router.get('/', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
@@ -56,13 +85,32 @@ router.get('/low-stock', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Product IDs that currently have at least one "active" batch (qty > 0 and
+// not expired, judged by year+month only). Used to power the New Sale
+// product picker so users can't select a product with nothing sellable.
+router.get('/active-products', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT product_id, qty, exp_date FROM inventory');
+    const activeIds = [...new Set(
+      rows.filter(isBatchActive).map(r => r.product_id)
+    )];
+    res.json(activeIds);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 router.get('/product/:product_id', auth, async (req, res) => {
   try {
     const [rows] = await db.query(
       'SELECT i.*, p.show_purchase_rate FROM inventory i JOIN products p ON p.id = i.product_id WHERE i.product_id=? ORDER BY batch_no',
       [req.params.product_id]
     );
-    const payload = await sanitizeInventoryRows(req, db, rows);
+    // ?active_only=1 restricts to sellable batches: qty > 0 and not expired
+    // (expiry judged by year+month only). Existing callers that manage/edit
+    // batches (including expired/zero-qty ones) keep working unchanged since
+    // this filter only applies when explicitly requested.
+    const { active_only } = req.query;
+    const filtered = active_only ? rows.filter(isBatchActive) : rows;
+    const payload = await sanitizeInventoryRows(req, db, filtered);
     res.json(payload);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

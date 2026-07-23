@@ -24,7 +24,8 @@ async function generateInvoiceNo(dateValue) {
 router.get('/', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
-      SELECT s.*, c.name as customer_name, e.name as salesman_name,
+      SELECT s.*, DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
+             c.name as customer_name, e.name as salesman_name,
              d.name as delivery_by_name,
              ci.name as city_name, a.name as area_name, t.name as territory_name
       FROM sales s
@@ -68,7 +69,8 @@ router.get('/history/rates', auth, async (req, res) => {
 router.get('/:id', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
-      SELECT s.*, c.name as customer_name, c.address as customer_address, c.phone as customer_phone,
+      SELECT s.*, DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
+             c.name as customer_name, c.address as customer_address, c.phone as customer_phone,
              c.license_no, c.license_expiry,
              e.name as salesman_name,
              d.name as delivery_by_name,
