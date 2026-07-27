@@ -359,4 +359,314 @@ router.post('/', auth, async (req, res) => {
   } finally { conn.release(); }
 });
 
+// ── Edit an existing recovery entry — ADMIN ONLY, allowed even if the invoice
+//    is already fully settled (recovery_status = 'completed'). ─────────────────
+//
+// Every side-effect of the ORIGINAL entry is reverted first:
+//   - all customer_ledger rows this entry created directly (discount row,
+//     cash-collected row, and locked-invoice return-credit rows) are deleted
+//     and their balance impact is reversed
+//   - inventory restocked by its return lines is taken back out
+//   - for any return line whose source invoice was still unlocked at the time
+//     (so the return had instead reduced that invoice's own qty/total and its
+//     own ledger row), that invoice's qty/total and ledger row are restored
+//
+// The corrected values are then re-applied using the same rules as creating a
+// brand-new entry (POST /). Finally every recovery row for the sale is walked
+// in date order to rebuild net_collectible/pending_amount snapshots and the
+// sale's own rollup columns, so payment history and reports never show a
+// stale figure after a correction.
+router.put('/:id', auth, async (req, res) => {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ message: 'Only an admin account can edit a recovery entry.' });
+  }
+  const conn = await db.getConnection();
+  await conn.beginTransaction();
+  try {
+    const recoveryId = parseInt(req.params.id);
+    const { date, notes, recovery_items, return_items, amount_recovered } = req.body;
+    if (!date) return res.status(400).json({ message: 'Date required' });
+
+    const [recRows] = await conn.query('SELECT * FROM recoveries WHERE id=?', [recoveryId]);
+    if (!recRows.length) return res.status(404).json({ message: 'Recovery not found' });
+    const saleId = recRows[0].sale_id;
+
+    // Lock the sale row for the duration of this transaction, same as POST /.
+    const [sRows] = await conn.query('SELECT * FROM sales WHERE id=? FOR UPDATE', [saleId]);
+    if (!sRows.length) return res.status(404).json({ message: 'Sale not found' });
+    const currentSale = sRows[0];
+
+    const [oldReturnItems] = await conn.query('SELECT * FROM return_items WHERE recovery_id=?', [recoveryId]);
+
+    // ── 1. Revert ledger rows this entry created directly, and reverse their
+    //    net effect on the customer's balance. ──────────────────────────────
+    const [oldLedgerRows] = await conn.query(
+      `SELECT id, dr, cr, description FROM customer_ledger WHERE reference_type='payment' AND reference_id=?`,
+      [recoveryId]
+    );
+    // Descriptions of the locked-invoice return-credit rows mention the source
+    // invoice number — used below to tell which old return lines went through
+    // the "locked" branch (fully reverted here) vs the "unlocked" branch
+    // (needs the source invoice's own qty/total/ledger row restored too).
+    const lockedReturnDescriptions = oldLedgerRows
+      .filter(r => r.description && r.description.startsWith('Return —'))
+      .map(r => r.description);
+
+    let reverseBalance = 0;
+    for (const lr of oldLedgerRows) reverseBalance += parseFloat(lr.cr || 0) - parseFloat(lr.dr || 0);
+    if (Math.abs(reverseBalance) > 0.0001) {
+      await conn.query('UPDATE customers SET balance=balance+? WHERE id=?', [reverseBalance, currentSale.customer_id]);
+    }
+    await conn.query(`DELETE FROM customer_ledger WHERE reference_type='payment' AND reference_id=?`, [recoveryId]);
+
+    // ── 2. Revert every old return line. ─────────────────────────────────────
+    for (const old of oldReturnItems) {
+      // Undo the restock that happened when this return was originally processed.
+      await conn.query('UPDATE inventory SET qty=qty-? WHERE product_id=? AND batch_no=?',
+        [old.qty_returned, old.product_id, old.batch_no]);
+
+      const [srcRows] = await conn.query('SELECT * FROM sales WHERE id=?', [old.sale_id]);
+      if (!srcRows.length) continue;
+      const srcSale = srcRows[0];
+      const wasLockedBranch = lockedReturnDescriptions.some(d => d.includes(srcSale.invoice_no));
+
+      if (!wasLockedBranch) {
+        // Was processed via the "unlocked" branch — restore the source invoice's
+        // sale_item qty/total, its rollup columns, and its own ledger DR row.
+        const [siRows] = await conn.query('SELECT * FROM sale_items WHERE id=?', [old.sale_item_id]);
+        if (siRows.length) {
+          const si = siRows[0];
+          const restoredQty = parseInt(si.qty) + parseInt(old.qty_returned);
+          const discFactor = 1 - parseFloat(si.discount_pct || 0) / 100;
+          const taxFactor = 1 + parseFloat(si.tax_pct || 0) / 100;
+          const restoredTotal = restoredQty * parseFloat(si.sale_rate) * discFactor * taxFactor;
+          await conn.query('UPDATE sale_items SET qty=?, total=? WHERE id=?', [restoredQty, restoredTotal.toFixed(2), si.id]);
+
+          const [sumRows] = await conn.query('SELECT SUM(total) as t FROM sale_items WHERE sale_id=?', [old.sale_id]);
+          const restoredSaleTotal = parseFloat(sumRows[0].t || 0);
+          await conn.query('UPDATE sales SET total_amount=?, net_collectible=?, pending_amount=? WHERE id=?',
+            [restoredSaleTotal, restoredSaleTotal, restoredSaleTotal, old.sale_id]);
+
+          const retAmt = parseFloat(old.return_amount || 0);
+          const [ledgerRows] = await conn.query(
+            'SELECT id FROM customer_ledger WHERE reference_type="sale" AND reference_id=?', [old.sale_id]);
+          if (ledgerRows.length) {
+            await conn.query('UPDATE customer_ledger SET dr=dr+?, balance=balance+? WHERE id=?',
+              [retAmt, retAmt, ledgerRows[0].id]);
+          } else {
+            const [custRows] = await conn.query('SELECT balance FROM customers WHERE id=?', [srcSale.customer_id]);
+            const newBal = parseFloat(custRows[0].balance) + retAmt;
+            await conn.query(
+              `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+               VALUES (?,?,?,?,?,?,?,?,?)`,
+              [srcSale.customer_id, srcSale.date, srcSale.invoice_no, `Invoice ${srcSale.invoice_no}`, retAmt, 0, newBal, 'sale', old.sale_id]
+            );
+          }
+          await conn.query('UPDATE customers SET balance=balance+? WHERE id=?', [retAmt, srcSale.customer_id]);
+        }
+      }
+    }
+
+    // The invoice being edited may itself have been the target of one of the
+    // "unlocked branch" reverts above (possible when a same-invoice return was
+    // recorded on the invoice's very first — and therefore still-unlocked-at-the-
+    // time — recovery event). Re-read its total_amount so later math is correct.
+    const [freshSaleRows] = await conn.query('SELECT total_amount FROM sales WHERE id=?', [saleId]);
+    currentSale.total_amount = freshSaleRows[0].total_amount;
+
+    // ── 3. Wipe the old line items — replaced with the corrected set below. ──
+    await conn.query('DELETE FROM recovery_items WHERE recovery_id=?', [recoveryId]);
+    await conn.query('DELETE FROM return_items WHERE recovery_id=?', [recoveryId]);
+
+    // ── 4. Re-apply the corrected values, same rules as POST /. ─────────────
+    const allReturnItems = return_items || [];
+    const expiryWarnings = [];
+    for (const item of allReturnItems) {
+      if (!item.qty_returned || parseInt(item.qty_returned) <= 0) continue;
+      const [invRows] = await conn.query('SELECT exp_date FROM inventory WHERE product_id=? AND batch_no=?',
+        [item.product_id, item.batch_no]);
+      if (invRows.length && invRows[0].exp_date) {
+        const expiryStr = String(invRows[0].exp_date).slice(0, 10);
+        const threshold = addMonthsPKT(expiryStr, -5);
+        if (todayPKT() > threshold) {
+          const [pRows] = await conn.query('SELECT name FROM products WHERE id=?', [item.product_id]);
+          const pName = pRows[0]?.name || `Product ID ${item.product_id}`;
+          const isExpired = todayPKT().slice(0, 7) > expiryStr.slice(0, 7);
+          if (isExpired) {
+            throw Object.assign(new Error(
+              `Return not allowed for "${pName}" (Batch: ${item.batch_no}). Product expired ${formatDatePKT(expiryStr)}.`
+            ), { status: 400 });
+          }
+          // Admin-only endpoint — inside the 5-month window is allowed, just warn.
+          expiryWarnings.push(
+            `"${pName}" (Batch: ${item.batch_no}) expires ${formatDatePKT(expiryStr)} — within 5 months of expiry. Returned anyway (admin override).`
+          );
+        }
+      }
+    }
+
+    const eventDiscount = (recovery_items || []).reduce((s, i) => s + parseFloat(i.discount_given || 0), 0);
+    const eventReturnAmount = allReturnItems.reduce((s, i) => s + parseFloat(i.return_amount || 0), 0);
+    const recoveredAmount = parseFloat(amount_recovered || 0);
+    if (Number.isNaN(recoveredAmount) || recoveredAmount < 0) {
+      throw Object.assign(new Error('Recovered amount must be zero or greater'), { status: 400 });
+    }
+
+    for (const item of (recovery_items || [])) {
+      await conn.query(
+        `INSERT INTO recovery_items (recovery_id, sale_item_id, product_id, batch_no, original_total, discount_given, final_amount)
+         VALUES (?,?,?,?,?,?,?)`,
+        [recoveryId, item.sale_item_id, item.product_id, item.batch_no,
+         item.original_total, item.discount_given || 0, item.final_amount]
+      );
+    }
+
+    if (eventDiscount > 0) {
+      await conn.query('UPDATE customers SET balance=balance-? WHERE id=?', [eventDiscount, currentSale.customer_id]);
+      const [c] = await conn.query('SELECT balance FROM customers WHERE id=?', [currentSale.customer_id]);
+      await conn.query(
+        `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [currentSale.customer_id, date, currentSale.invoice_no, `Discount on Invoice ${currentSale.invoice_no} (Edited)`,
+         0, eventDiscount, c[0].balance, 'payment', recoveryId]
+      );
+    }
+
+    for (const item of allReturnItems) {
+      if (!item.qty_returned || parseInt(item.qty_returned) <= 0) continue;
+      const qtyRet = parseInt(item.qty_returned);
+      const retRate = parseFloat(item.return_rate || 0);
+      const retAmt = qtyRet * retRate;
+
+      const [srcSaleRows] = await conn.query('SELECT * FROM sales WHERE id=?', [item.sale_id]);
+      if (!srcSaleRows.length) continue;
+      const srcSale = srcSaleRows[0];
+
+      await conn.query(
+        `INSERT INTO return_items (recovery_id, sale_id, sale_item_id, product_id, batch_no, qty_returned, return_rate, return_amount)
+         VALUES (?,?,?,?,?,?,?,?)`,
+        [recoveryId, item.sale_id, item.sale_item_id, item.product_id, item.batch_no, qtyRet, retRate, retAmt]
+      );
+
+      await conn.query('UPDATE inventory SET qty=qty+? WHERE product_id=? AND batch_no=?',
+        [qtyRet, item.product_id, item.batch_no]);
+
+      if (!srcSale.is_locked) {
+        const [siRows] = await conn.query('SELECT * FROM sale_items WHERE id=?', [item.sale_item_id]);
+        if (siRows.length > 0) {
+          const si = siRows[0];
+          const newQty = Math.max(0, parseInt(si.qty) - qtyRet);
+          if (newQty <= 0) {
+            await conn.query('UPDATE sale_items SET qty=0, total=0 WHERE id=?', [si.id]);
+          } else {
+            const discFactor = 1 - parseFloat(si.discount_pct || 0) / 100;
+            const taxFactor = 1 + parseFloat(si.tax_pct || 0) / 100;
+            const newTotal = newQty * parseFloat(si.sale_rate) * discFactor * taxFactor;
+            await conn.query('UPDATE sale_items SET qty=?, total=? WHERE id=?', [newQty, newTotal.toFixed(2), si.id]);
+          }
+
+          const [newItems] = await conn.query('SELECT SUM(total) as t FROM sale_items WHERE sale_id=?', [item.sale_id]);
+          const newSaleTotal = parseFloat(newItems[0].t || 0);
+          await conn.query(
+            'UPDATE sales SET total_amount=?, net_collectible=?, pending_amount=? WHERE id=?',
+            [newSaleTotal, newSaleTotal, newSaleTotal, item.sale_id]
+          );
+
+          const [ledgerRows] = await conn.query(
+            'SELECT id, dr, cr FROM customer_ledger WHERE reference_type="sale" AND reference_id=?',
+            [item.sale_id]
+          );
+          if (ledgerRows.length > 0) {
+            const ledgerRow = ledgerRows[0];
+            const newDr = parseFloat(ledgerRow.dr) - retAmt;
+            if (newDr <= 0.009 && parseFloat(ledgerRow.cr || 0) <= 0.009) {
+              await conn.query('DELETE FROM customer_ledger WHERE id=?', [ledgerRow.id]);
+            } else {
+              await conn.query(
+                'UPDATE customer_ledger SET dr=?, balance=balance-? WHERE id=?',
+                [Math.max(0, newDr).toFixed(2), retAmt, ledgerRow.id]
+              );
+            }
+          }
+          await conn.query('UPDATE customers SET balance=balance-? WHERE id=?', [retAmt, srcSale.customer_id]);
+        }
+      } else {
+        await conn.query('UPDATE customers SET balance=balance-? WHERE id=?', [retAmt, currentSale.customer_id]);
+        const [c2] = await conn.query('SELECT balance FROM customers WHERE id=?', [currentSale.customer_id]);
+        await conn.query(
+          `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+          [currentSale.customer_id, date, srcSale.invoice_no,
+           `Return — ${qtyRet} unit(s) of ${item.product_name || 'product'} from ${srcSale.invoice_no} (Edited)`,
+           0, retAmt, c2[0].balance, 'payment', recoveryId]
+        );
+      }
+    }
+
+    if (recoveredAmount > 0) {
+      await conn.query('UPDATE customers SET balance=balance-? WHERE id=?', [recoveredAmount, currentSale.customer_id]);
+      const [c3] = await conn.query('SELECT balance FROM customers WHERE id=?', [currentSale.customer_id]);
+      const payDesc = `Cash Collected — Invoice ${currentSale.invoice_no} (Edited)${notes ? ' (' + notes + ')' : ''}`;
+      await conn.query(
+        `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [currentSale.customer_id, date, currentSale.invoice_no, payDesc, 0, recoveredAmount, c3[0].balance, 'payment', recoveryId]
+      );
+    }
+
+    await conn.query(
+      'UPDATE recoveries SET date=?, notes=?, total_discount=?, total_return_amount=?, net_collected=? WHERE id=?',
+      [date, notes || null, eventDiscount, eventReturnAmount, recoveredAmount, recoveryId]
+    );
+
+    // ── 5. Rebuild net_collectible/pending_amount for every recovery on this
+    //    sale, in chronological order, plus the sale's own rollup columns —
+    //    keeps payment history and reports internally consistent after a
+    //    mid-history correction. ─────────────────────────────────────────────
+    const [allRecoveries] = await conn.query(
+      'SELECT id, total_discount, total_return_amount, net_collected FROM recoveries WHERE sale_id=? ORDER BY date ASC, id ASC',
+      [saleId]
+    );
+    let runDiscount = 0, runReturn = 0, runRecovered = 0, finalNet = 0, finalPending = 0;
+    for (const r of allRecoveries) {
+      runDiscount += parseFloat(r.total_discount || 0);
+      runReturn += parseFloat(r.total_return_amount || 0);
+      runRecovered += parseFloat(r.net_collected || 0);
+      const netCollectible = parseFloat(currentSale.total_amount) - runDiscount - runReturn;
+      if (netCollectible < -0.01) {
+        throw Object.assign(new Error('Discount and returns exceed invoice total after this edit'), { status: 400 });
+      }
+      const pendingAmount = Math.max(0, netCollectible - runRecovered);
+      await conn.query('UPDATE recoveries SET net_collectible=?, pending_amount=? WHERE id=?',
+        [netCollectible, pendingAmount, r.id]);
+      finalNet = netCollectible; finalPending = pendingAmount;
+    }
+    const recoveryStatus = finalPending <= 0.009 ? 'completed' : 'pending';
+
+    await conn.query(
+      `UPDATE sales SET total_discount=?, total_return_amount=?, net_collectible=?, total_recovered=?, pending_amount=?, recovery_status=? WHERE id=?`,
+      [runDiscount, runReturn, finalNet, runRecovered, finalPending, recoveryStatus, saleId]
+    );
+
+    await conn.commit();
+    await logAudit(req, 'UPDATE', 'recovery', recoveryId,
+      `Recovery on invoice ${currentSale.invoice_no} edited by admin: discount ${eventDiscount}, returns ${eventReturnAmount}, recovered ${recoveredAmount}, pending ${finalPending}, status ${recoveryStatus}`);
+
+    res.json({
+      id: recoveryId,
+      net_collectible: finalNet,
+      amount_recovered: recoveredAmount,
+      total_recovered: runRecovered,
+      pending_amount: finalPending,
+      net_collected: recoveredAmount,
+      recovery_status: recoveryStatus,
+      expiry_warnings: expiryWarnings.length ? expiryWarnings : undefined,
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(err.status || 500).json({ message: err.message });
+  } finally { conn.release(); }
+});
+
 module.exports = router;
