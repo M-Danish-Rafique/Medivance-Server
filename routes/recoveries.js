@@ -74,10 +74,11 @@ router.get('/:id', auth, async (req, res) => {
       `SELECT ri.*, p.name as product_name FROM recovery_items ri
        JOIN products p ON ri.product_id = p.id WHERE ri.recovery_id=?`, [req.params.id]);
     const [retItems] = await db.query(
-      `SELECT rt.*, p.name as product_name, s.invoice_no as source_invoice
+      `SELECT rt.*, p.name as product_name, s.invoice_no as source_invoice, si.qty as current_sold_qty
        FROM return_items rt
        JOIN products p ON rt.product_id = p.id
        JOIN sales s ON rt.sale_id = s.id
+       LEFT JOIN sale_items si ON si.id = rt.sale_item_id
        WHERE rt.recovery_id=?`, [req.params.id]);
     res.json({ ...rows[0], recovery_items: recItems, return_items: retItems });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -149,6 +150,15 @@ router.post('/', auth, async (req, res) => {
       }
     }
 
+    // ── Server-side guard: discount per line can't be negative or exceed that line's invoice amount ──
+    for (const item of (recovery_items || [])) {
+      const disc = parseFloat(item.discount_given || 0);
+      const cap = parseFloat(item.original_total || 0);
+      if (disc < 0 || disc > cap) {
+        return res.status(400).json({ message: `Discount given for "${item.product_name || 'an item'}" must be between 0 and its invoice amount (${cap}).` });
+      }
+    }
+
     // ── This event's discount / return amounts (not cumulative) ─────
     const eventDiscount = (recovery_items || []).reduce((s, i) => s + parseFloat(i.discount_given || 0), 0);
     const eventReturnAmount = allReturnItems.reduce((s, i) => s + parseFloat(i.return_amount || 0), 0);
@@ -167,7 +177,8 @@ router.post('/', auth, async (req, res) => {
 
     const pendingBeforeThisPayment = netCollectible - priorRecovered;
 
-    let recoveredAmount = pendingBeforeThisPayment; // default: settle whatever is still outstanding
+    // Amount recovered is always explicit — never auto-filled to "settle everything".
+    let recoveredAmount = 0;
     if (amount_recovered !== undefined && amount_recovered !== null && amount_recovered !== '') {
       recoveredAmount = parseFloat(amount_recovered);
       if (Number.isNaN(recoveredAmount) || recoveredAmount < 0) {
@@ -505,6 +516,17 @@ router.put('/:id', auth, async (req, res) => {
       }
     }
 
+    // ── Server-side guard: discount per line can't be negative or exceed that line's invoice amount ──
+    for (const item of (recovery_items || [])) {
+      const disc = parseFloat(item.discount_given || 0);
+      const cap = parseFloat(item.original_total || 0);
+      if (disc < 0 || disc > cap) {
+        throw Object.assign(new Error(
+          `Discount given for "${item.product_name || 'an item'}" must be between 0 and its invoice amount (${cap}).`
+        ), { status: 400 });
+      }
+    }
+
     const eventDiscount = (recovery_items || []).reduce((s, i) => s + parseFloat(i.discount_given || 0), 0);
     const eventReturnAmount = allReturnItems.reduce((s, i) => s + parseFloat(i.return_amount || 0), 0);
     const recoveredAmount = parseFloat(amount_recovered || 0);
@@ -635,6 +657,9 @@ router.put('/:id', auth, async (req, res) => {
       const netCollectible = parseFloat(currentSale.total_amount) - runDiscount - runReturn;
       if (netCollectible < -0.01) {
         throw Object.assign(new Error('Discount and returns exceed invoice total after this edit'), { status: 400 });
+      }
+      if (runRecovered - netCollectible > 0.01) {
+        throw Object.assign(new Error('Amount recovered cannot exceed the pending balance for this invoice'), { status: 400 });
       }
       const pendingAmount = Math.max(0, netCollectible - runRecovered);
       await conn.query('UPDATE recoveries SET net_collectible=?, pending_amount=? WHERE id=?',
