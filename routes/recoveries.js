@@ -57,6 +57,151 @@ router.get('/pending-invoices/:customerId', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── Quick Recovery: list pending invoices for fast end-of-day collection ──
+router.get('/quick-list', auth, async (req, res) => {
+  try {
+    const { date_from, date_to, salesman_id, supplier_id } = req.query;
+    let sql = `
+      SELECT s.id, s.invoice_no, s.date, s.total_amount, s.pending_amount,
+             s.recovery_status, s.salesman_id, s.delivery_by,
+             c.name as customer_name
+      FROM sales s
+      JOIN customers c ON s.customer_id = c.id
+      WHERE s.recovery_status = 'pending'
+    `;
+    const params = [];
+    if (date_from) { sql += ' AND s.date >= ?'; params.push(date_from); }
+    if (date_to)   { sql += ' AND s.date <= ?'; params.push(date_to); }
+    if (salesman_id) { sql += ' AND s.salesman_id = ?'; params.push(salesman_id); }
+    if (supplier_id) { sql += ' AND s.delivery_by = ?'; params.push(supplier_id); }
+    sql += ' ORDER BY s.date ASC, s.invoice_no ASC';
+    const [rows] = await db.query(sql, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Bulk Recovery: bulk-settle a batch of invoices in one shot ──
+// Body: { date: 'YYYY-MM-DD', entries: [{ invoice_no, discount }] }
+// Each invoice is fully collected (pending_amount - discount) — there's
+// no partial-cash concept here, unlike the detailed Recovery modal.
+router.post('/bulk', auth, async (req, res) => {
+  const { date, entries } = req.body;
+  if (!date) return res.status(400).json({ message: 'Date required' });
+  if (!Array.isArray(entries) || !entries.length) {
+    return res.status(400).json({ message: 'No invoices selected' });
+  }
+
+  const results = []; // { invoice_no, success, message, recovered? }
+
+  for (const entry of entries) {
+    const invoiceNo = entry.invoice_no;
+    const discount = Number.isNaN(parseFloat(entry.discount)) ? 0 : parseFloat(entry.discount);
+    const conn = await db.getConnection();
+    await conn.beginTransaction();
+    try {
+      if (discount < 0) {
+        throw Object.assign(new Error('Discount cannot be negative'), { status: 400 });
+      }
+
+      const [sRows] = await conn.query('SELECT * FROM sales WHERE invoice_no=? FOR UPDATE', [invoiceNo]);
+      if (!sRows.length) throw Object.assign(new Error('Invoice not found'), { status: 404 });
+      const sale = sRows[0];
+
+      if (sale.recovery_status === 'completed') {
+        throw Object.assign(new Error('Already fully recovered'), { status: 400 });
+      }
+
+      const priorDiscount = parseFloat(sale.total_discount || 0);
+      const priorReturn = parseFloat(sale.total_return_amount || 0);
+      const priorRecovered = parseFloat(sale.total_recovered || 0);
+
+      const maxDiscount = parseFloat(sale.total_amount) - priorDiscount - priorReturn;
+      if (discount > maxDiscount + 0.009) {
+        throw Object.assign(new Error(`Discount exceeds remaining invoice amount (${maxDiscount.toFixed(2)})`), { status: 400 });
+      }
+
+      const newTotalDiscount = priorDiscount + discount;
+      const netCollectible = parseFloat(sale.total_amount) - newTotalDiscount - priorReturn;
+      const pendingBeforeThisPayment = Math.max(0, netCollectible - priorRecovered);
+
+      // Quick Recovery always collects the full remaining balance.
+      const recoveredAmount = pendingBeforeThisPayment;
+      const newTotalRecovered = priorRecovered + recoveredAmount;
+      const pendingAmount = Math.max(0, netCollectible - newTotalRecovered);
+      const recoveryStatus = pendingAmount <= 0.009 ? 'completed' : 'pending';
+
+      const [result] = await conn.query(
+        `INSERT INTO recoveries (sale_id, salesman_id, date, notes, total_discount, total_return_amount, net_collectible, net_collected, pending_amount)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [sale.id, sale.delivery_by || null, date, 'Quick Recovery', discount, 0, netCollectible, recoveredAmount, pendingAmount]
+      );
+      const recoveryId = result.insertId;
+
+      // Allocate the flat discount proportionally across sale_items, so
+      // recovery_items (and downstream Edit/History views) stay consistent
+      // with how the detailed Recovery flow records line-level discounts.
+      if (discount > 0) {
+        const [items] = await conn.query('SELECT id, product_id, batch_no, total FROM sale_items WHERE sale_id=? AND total > 0', [sale.id]);
+        const lineTotalSum = items.reduce((s, i) => s + parseFloat(i.total), 0);
+        let allocated = 0;
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const isLast = i === items.length - 1;
+          const share = isLast
+            ? discount - allocated
+            : Math.round((discount * (parseFloat(item.total) / lineTotalSum)) * 100) / 100;
+          allocated += share;
+          await conn.query(
+            `INSERT INTO recovery_items (recovery_id, sale_item_id, product_id, batch_no, original_total, discount_given, final_amount)
+             VALUES (?,?,?,?,?,?,?)`,
+            [recoveryId, item.id, item.product_id, item.batch_no, item.total, share, parseFloat(item.total) - share]
+          );
+        }
+
+        await conn.query('UPDATE customers SET balance=balance-? WHERE id=?', [discount, sale.customer_id]);
+        const [custAfterDisc] = await conn.query('SELECT balance FROM customers WHERE id=?', [sale.customer_id]);
+        await conn.query(
+          `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+          [sale.customer_id, date, sale.invoice_no, `Discount on Invoice ${sale.invoice_no} (Quick Recovery)`, 0, discount, custAfterDisc[0].balance, 'payment', recoveryId]
+        );
+      }
+
+      if (recoveredAmount > 0) {
+        await conn.query('UPDATE customers SET balance=balance-? WHERE id=?', [recoveredAmount, sale.customer_id]);
+        const [custRows] = await conn.query('SELECT balance FROM customers WHERE id=?', [sale.customer_id]);
+        await conn.query(
+          `INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+          [sale.customer_id, date, sale.invoice_no, `Cash Collected — Invoice ${sale.invoice_no} (Quick Recovery)`, 0, recoveredAmount, custRows[0].balance, 'payment', recoveryId]
+        );
+      }
+
+      await conn.query(
+        `UPDATE sales SET is_locked=1, total_discount=?, total_return_amount=?, net_collectible=?,
+                total_recovered=?, pending_amount=?, recovery_status=? WHERE id=?`,
+        [newTotalDiscount, priorReturn, netCollectible, newTotalRecovered, pendingAmount, recoveryStatus, sale.id]
+      );
+
+      await conn.commit();
+      await logAudit(req, 'CREATE', 'recovery', recoveryId,
+        `Quick Recovery on invoice ${sale.invoice_no}: discount ${discount}, recovered ${recoveredAmount}, status ${recoveryStatus}`);
+
+      results.push({ invoice_no: invoiceNo, success: true, recovered: recoveredAmount, discount });
+    } catch (err) {
+      await conn.rollback();
+      results.push({ invoice_no: invoiceNo, success: false, message: err.message });
+    } finally { conn.release(); }
+  }
+
+  const failed = results.filter(r => !r.success);
+  res.status(failed.length && failed.length === results.length ? 400 : 200).json({
+    results,
+    successCount: results.length - failed.length,
+    failCount: failed.length,
+  });
+});
+
 router.get('/:id', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
