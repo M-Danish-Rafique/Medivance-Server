@@ -92,7 +92,9 @@ router.get('/:id', auth, async (req, res) => {
                NULLIF(p.retail_price, 0), 0
              ) as retail_price,
              (SELECT inv.exp_date FROM inventory inv
-              WHERE inv.product_id=si.product_id AND inv.batch_no=si.batch_no LIMIT 1) as exp_date
+              WHERE inv.product_id=si.product_id AND inv.batch_no=si.batch_no LIMIT 1) as exp_date,
+             (SELECT COALESCE(SUM(rt.qty_returned), 0) FROM return_items rt
+              WHERE rt.sale_item_id=si.id) as already_returned
       FROM sale_items si
       JOIN products p ON si.product_id=p.id WHERE si.sale_id=?`, [req.params.id]);
     res.json({ ...rows[0], items });
