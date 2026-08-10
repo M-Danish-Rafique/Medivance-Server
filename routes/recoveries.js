@@ -238,6 +238,37 @@ router.get('/quick-list', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── Quick Return: list fully-settled invoices eligible for a standalone
+//    (not linked-to-a-new-invoice) return — used by the Quick Return page.
+//    Unlike Quick Recovery, this is normally aimed at one known invoice or
+//    customer rather than a bulk date-range sweep, so customer (via the
+//    CustomerAutocomplete, exact match) and invoice number (free text) are
+//    the primary filters; date range and salesman/supplier stay available
+//    as secondary narrowing filters. ─────────────────────────────────────
+router.get('/quick-return-list', auth, async (req, res) => {
+  try {
+    const { date_from, date_to, salesman_id, supplier_id, customer_id, invoice_no } = req.query;
+    let sql = `
+      SELECT s.id, s.invoice_no, s.date, s.total_amount, s.total_recovered,
+             s.total_return_amount, s.recovery_status, s.salesman_id, s.delivery_by,
+             c.id as customer_id, c.name as customer_name
+      FROM sales s
+      JOIN customers c ON s.customer_id = c.id
+      WHERE s.recovery_status = 'completed'
+    `;
+    const params = [];
+    if (date_from) { sql += ' AND s.date >= ?'; params.push(date_from); }
+    if (date_to)   { sql += ' AND s.date <= ?'; params.push(date_to); }
+    if (salesman_id) { sql += ' AND s.salesman_id = ?'; params.push(salesman_id); }
+    if (supplier_id) { sql += ' AND s.delivery_by = ?'; params.push(supplier_id); }
+    if (customer_id) { sql += ' AND s.customer_id = ?'; params.push(customer_id); }
+    if (invoice_no && invoice_no.trim()) { sql += ' AND s.invoice_no LIKE ?'; params.push(`%${invoice_no.trim()}%`); }
+    sql += ' ORDER BY s.date DESC, s.invoice_no DESC LIMIT 200';
+    const [rows] = await db.query(sql, params);
+    res.json(rows);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── Bulk Recovery: bulk-settle a batch of invoices in one shot ──
 // Body: { date: 'YYYY-MM-DD', entries: [{ invoice_no, discount }] }
 // Each invoice is fully collected (pending_amount - discount) — there's
@@ -402,8 +433,18 @@ router.post('/', auth, async (req, res) => {
     if (sRows.length === 0) return res.status(404).json({ message: 'Sale not found' });
     const currentSale = sRows[0];
 
+    // A completed invoice can't take MORE discount or MORE cash — there's
+    // nothing left to collect. But a pure return (no discount, no cash) is
+    // exactly what Quick Return needs: crediting the customer back for
+    // returned goods on an invoice that's already fully settled. That's the
+    // same 'credit' branch classifyReturnLine already produces for a locked
+    // + completed invoice, so it's safe to let it through here.
     if (currentSale.recovery_status === 'completed') {
-      return res.status(400).json({ message: `Invoice ${currentSale.invoice_no} is already fully recovered.` });
+      const requestingDiscount = (recovery_items || []).some(i => parseFloat(i.discount_given || 0) > 0);
+      const requestingCash = parseFloat(amount_recovered || 0) > 0;
+      if (requestingDiscount || requestingCash) {
+        return res.status(400).json({ message: `Invoice ${currentSale.invoice_no} is already fully recovered.` });
+      }
     }
 
     // ── Expiry validation for ALL return items ──────────────────────
@@ -505,7 +546,14 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ message: 'Discount and returns exceed invoice total' });
     }
 
-    const pendingBeforeThisPayment = netCollectible - priorRecovered;
+    // A return can bring net_collectible below what's already been recovered
+    // (e.g. a Quick Return against a fully-settled invoice, or any return
+    // larger than what's currently still owed) — that means the customer is
+    // now owed money back, which the return's own ledger credit already
+    // handles. It does NOT mean this invoice has negative pending debt, so
+    // floor it at 0 rather than letting a negative value block amount_recovered
+    // validation below.
+    const pendingBeforeThisPayment = Math.max(0, netCollectible - priorRecovered);
 
     // Amount recovered is always explicit — never auto-filled to "settle everything".
     let recoveredAmount = 0;
