@@ -4,6 +4,21 @@ const db = require('../config/db');
 const auth = require('../middleware/auth');
 const { sanitizeProductRows } = require('../utils/purchaseRateAccess');
 
+// Two products with the same name AND the same pack size are not allowed.
+// pack_size is NOT NULL at the DB level (defaults to ''), so this is a plain
+// trimmed comparison — the column's _ci collation already makes name/pack_size
+// comparisons case-insensitive at the DB layer; TRIM here catches stray
+// leading/trailing whitespace, which the collation does not.
+async function findDuplicateProduct(db, name, pack_size, excludeId) {
+  const normalizedPackSize = (pack_size || '').trim();
+  const params = [name, normalizedPackSize];
+  let sql = `SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND TRIM(pack_size) = ?`;
+  if (excludeId) { sql += ' AND id != ?'; params.push(excludeId); }
+  sql += ' LIMIT 1';
+  const [rows] = await db.query(sql, params);
+  return rows.length > 0;
+}
+
 router.get('/', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
@@ -44,6 +59,10 @@ router.post('/', auth, async (req, res) => {
             category_id, volume, volume_uom_id, is_manufactured, tax_applicable, sale_tax_pct,
             show_purchase_rate } = req.body;
     if (!name) return res.status(400).json({ message: 'Product name is required' });
+    if (!pack_size || !pack_size.trim()) return res.status(400).json({ message: 'Pack size is required' });
+    if (await findDuplicateProduct(db, name, pack_size)) {
+      return res.status(400).json({ message: 'A product with this name and pack size already exists' });
+    }
     const isAdmin = req.user?.role === 'admin';
     const showPurchaseRateValue = isAdmin
       ? (show_purchase_rate === undefined ? 1 : (show_purchase_rate ? 1 : 0))
@@ -52,12 +71,17 @@ router.post('/', auth, async (req, res) => {
       `INSERT INTO products (name, pack_size, purchase_rate, show_purchase_rate, sale_rate, retail_price, company_id,
          category_id, volume, volume_uom_id, is_manufactured, tax_applicable, sale_tax_pct)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [name, pack_size, isAdmin ? (purchase_rate || 0) : 0, showPurchaseRateValue, sale_rate || 0, retail_price || 0, company_id || null,
+      [name.trim(), (pack_size || '').trim(), isAdmin ? (purchase_rate || 0) : 0, showPurchaseRateValue, sale_rate || 0, retail_price || 0, company_id || null,
        category_id || null, volume || null, volume_uom_id || null,
        is_manufactured || 0, tax_applicable || 0, sale_tax_pct || 0]
     );
     res.status(201).json({ id: result.insertId, ...req.body });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ message: 'A product with this name and pack size already exists' });
+    }
+    res.status(500).json({ message: err.message });
+  }
 });
 
 router.put('/:id', auth, async (req, res) => {
@@ -65,12 +89,17 @@ router.put('/:id', auth, async (req, res) => {
     const { name, pack_size, purchase_rate, sale_rate, retail_price, company_id,
             category_id, volume, volume_uom_id, is_manufactured, tax_applicable, sale_tax_pct,
             show_purchase_rate } = req.body;
+    if (!name) return res.status(400).json({ message: 'Product name is required' });
+    if (!pack_size || !pack_size.trim()) return res.status(400).json({ message: 'Pack size is required' });
+    if (await findDuplicateProduct(db, name, pack_size, req.params.id)) {
+      return res.status(400).json({ message: 'A product with this name and pack size already exists' });
+    }
     const isAdmin = req.user?.role === 'admin';
     const showPurchaseRateValue = isAdmin
       ? (show_purchase_rate === undefined ? undefined : (show_purchase_rate ? 1 : 0))
       : undefined;
     const fields = ['name=?', 'pack_size=?'];
-    const values = [name, pack_size];
+    const values = [name.trim(), (pack_size || '').trim()];
 
     if (isAdmin) {
       fields.push('purchase_rate=?');
@@ -90,7 +119,12 @@ router.put('/:id', auth, async (req, res) => {
     values.push(req.params.id);
     await db.query(`UPDATE products SET ${fields.join(', ')} WHERE id=?`, values);
     res.json({ message: 'Updated successfully' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ message: 'A product with this name and pack size already exists' });
+    }
+    res.status(500).json({ message: err.message });
+  }
 });
 
 router.delete('/:id', auth, async (req, res) => {
