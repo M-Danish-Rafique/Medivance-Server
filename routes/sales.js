@@ -27,7 +27,8 @@ router.get('/', auth, async (req, res) => {
       SELECT s.*, DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
              c.name as customer_name, e.name as salesman_name,
              d.name as delivery_by_name,
-             ci.name as city_name, a.name as area_name, t.name as territory_name
+             ci.name as city_name, a.name as area_name, t.name as territory_name,
+             (SELECT GROUP_CONCAT(DISTINCT si.product_id) FROM sale_items si WHERE si.sale_id = s.id) as product_ids
       FROM sales s
       JOIN customers c ON s.customer_id=c.id
       LEFT JOIN employees e ON s.salesman_id=e.id
