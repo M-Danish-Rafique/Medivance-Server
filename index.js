@@ -36,6 +36,7 @@ app.use('/api/suppliers', require('./routes/suppliers'));
 app.use('/api/inventory', require('./routes/inventory'));
 app.use('/api/purchases', require('./routes/purchases'));
 app.use('/api/sales', require('./routes/sales'));
+app.use('/api/print-queue', require('./routes/printQueue'));
 app.use('/api/finance', require('./routes/finance'));
 app.use('/api/reports', require('./routes/reports'));
 app.use('/api/recoveries', require('./routes/recoveries'));

@@ -138,11 +138,22 @@ router.post('/', auth, async (req, res) => {
     }
 
     await conn.query('UPDATE customers SET balance=balance+? WHERE id=?', [total_amount, customer_id]);
-    const [custRows] = await conn.query('SELECT balance FROM customers WHERE id=?', [customer_id]);
+    const [custRows] = await conn.query('SELECT balance, name, is_licensed FROM customers WHERE id=?', [customer_id]);
     const newBalance = custRows[0].balance;
     await conn.query(
       'INSERT INTO customer_ledger (customer_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id) VALUES (?,?,?,?,?,?,?,?,?)',
       [customer_id, date, invoice_no, 'Sale', total_amount, 0, newBalance, 'sale', sId]
+    );
+
+    // Add to the Print Queue instead of prompting the user to print right away.
+    // Default file name: <Invoice No>_<Customer>_<Customer ID>.pdf — user can edit it later.
+    // Default type: Licensed customers -> Warranty, Non-Licensed -> Non-Warranty.
+    const safeCustomerName = String(custRows[0].name || 'Customer').replace(/[\\/:*?"<>|]+/g, '').trim() || 'Customer';
+    const defaultPdfName = `${invoice_no}_${safeCustomerName}_${customer_id}.pdf`;
+    const defaultInvoiceType = custRows[0].is_licensed ? 'warranty' : 'non-warranty';
+    await conn.query(
+      'INSERT INTO print_queue (sale_id, invoice_no, pdf_name, invoice_type, is_selected) VALUES (?,?,?,?,1)',
+      [sId, invoice_no, defaultPdfName, defaultInvoiceType]
     );
 
     // Tax ledger for taxable products
