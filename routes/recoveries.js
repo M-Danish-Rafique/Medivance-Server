@@ -510,6 +510,13 @@ router.post('/', auth, async (req, res) => {
     //    net_collectible math below is what lets a 'source_pending' cross
     //    return be rejected up front, instead of partially applying. ──────
     const validReturnItems = allReturnItems.filter(i => i.qty_returned && parseInt(i.qty_returned) > 0);
+    // Disallow returns that target a different (previous) invoice — returns
+    // are only allowed against the current invoice in this workflow.
+    for (const item of validReturnItems) {
+      if (parseInt(item.sale_id, 10) !== parseInt(sale_id, 10)) {
+        throw Object.assign(new Error('Returns against previous invoices are not allowed. Return items must reference the current invoice.'), { status: 400 });
+      }
+    }
     const classifiedReturns = [];
     for (const item of validReturnItems) {
       classifiedReturns.push(await classifyReturnLine(conn, item, currentSale));
@@ -836,6 +843,13 @@ router.put('/:id', auth, async (req, res) => {
     //    deleted in step 3, so the "already returned" sums used by the guard
     //    correctly exclude this entry's own old lines. ──────────────────────
     const validReturnItems = allReturnItems.filter(i => i.qty_returned && parseInt(i.qty_returned) > 0);
+    // Disallow returns referencing a different invoice when editing — keep
+    // returns strictly tied to the invoice being settled.
+    for (const item of validReturnItems) {
+      if (parseInt(item.sale_id, 10) !== parseInt(saleId, 10)) {
+        throw Object.assign(new Error('Returns against previous invoices are not allowed. Return items must reference the current invoice.'), { status: 400 });
+      }
+    }
     const classifiedReturns = [];
     for (const item of validReturnItems) {
       classifiedReturns.push(await classifyReturnLine(conn, item, currentSale));
