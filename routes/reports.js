@@ -339,18 +339,22 @@ async function fetchSalesReportData({ from_date, to_date, salesman_id }) {
   // recoveries.js), total_amount is recalculated down to what's left after that
   // return. So total_amount is the correct NET figure, not the gross sale value.
   // Gross is reconstructed by adding back what was discounted/returned.
+
   let sql = `
     SELECT s.id, s.date, s.invoice_no, c.name AS customer_name,
            e.name AS salesman_name,
-           s.total_amount AS net_amount,
-           COALESCE(r.total_return_amount, 0) AS return_amount,
-           COALESCE(r.total_discount, 0) AS discount,
-           (s.total_amount + COALESCE(r.total_return_amount, 0) + COALESCE(r.total_discount, 0)) AS gross_amount,
-           COALESCE(r.net_collected, 0) AS recovered_amount
+           s.total_amount AS gross_amount, 
+           COALESCE(r_agg.total_return_amount, 0) AS return_amount,
+           COALESCE(r_agg.total_discount, 0) AS discount,
+           (s.total_amount - COALESCE(r_agg.total_return_amount, 0) - COALESCE(r_agg.total_discount, 0)) AS net_amount,
+           COALESCE(r_agg.net_collected, 0) AS recovered_amount
     FROM sales s
     JOIN customers c ON s.customer_id = c.id
     LEFT JOIN employees e ON s.salesman_id = e.id
-    LEFT JOIN recoveries r ON r.sale_id = s.id
+    LEFT JOIN (
+      SELECT sale_id, SUM(total_return_amount) AS total_return_amount, SUM(total_discount) AS total_discount, SUM(net_collected) AS net_collected
+      FROM recoveries GROUP BY sale_id
+    ) r_agg ON r_agg.sale_id = s.id
     WHERE 1=1`;
   const params = [];
   if (from_date)   { sql += ' AND s.date >= ?'; params.push(from_date); }
@@ -371,18 +375,14 @@ async function fetchRecoveryReportData({ from_date, to_date, supplier_id }) {
     SELECT
       r.id,
       r.date,
+      r.sale_id,
       c.name AS customer_name,
       s.invoice_no,
-      (s.total_amount + COALESCE(r.total_return_amount, 0) + COALESCE(r.total_discount, 0)) AS gross_amount,
-      COALESCE(r.net_collected, 0) AS recovered_amount,
-      (COALESCE(r.total_discount, 0) + COALESCE(r.total_return_amount, 0)) AS return_discount,
-      COALESCE(
-        r.pending_amount,
-        s.total_amount
-          - COALESCE(r.net_collected, 0)
-          - COALESCE(r.total_discount, 0)
-          - COALESCE(r.total_return_amount, 0)
-      ) AS net_pending
+      s.total_amount AS sale_total_amount,
+      COALESCE(r.total_return_amount, 0) AS total_return_amount,
+      COALESCE(r.total_discount, 0) AS total_discount,
+      COALESCE(r.net_collected, 0) AS net_collected,
+      COALESCE(r.pending_amount, NULL) AS pending_amount
     FROM recoveries r
     JOIN sales s ON r.sale_id = s.id
     JOIN customers c ON s.customer_id = c.id
@@ -409,7 +409,44 @@ async function fetchRecoveryReportData({ from_date, to_date, supplier_id }) {
   sql += ' ORDER BY r.date ASC, r.id ASC';
 
   const [rows] = await db.query(sql, params);
-  return rows;
+
+  // Post-process: compute sequential gross/net per sale_id (ordered by date)
+  const bySale = new Map();
+  for (const r of rows) {
+    const key = String(r.sale_id || '');
+    if (!bySale.has(key)) bySale.set(key, []);
+    bySale.get(key).push(r);
+  }
+
+  const out = [];
+  for (const [saleId, recs] of bySale.entries()) {
+    // sort by date then id just to be safe
+    recs.sort((a, b) => new Date(a.date) - new Date(b.date) || a.id - b.id);
+    let prevPending = parseFloat(recs[0].sale_total_amount) || 0; // initial gross = sale total
+    for (const r of recs) {
+      const discount = parseFloat(r.total_discount) || 0;
+      const ret = parseFloat(r.total_return_amount) || 0;
+      const recov = parseFloat(r.net_collected) || 0;
+      const gross = prevPending;
+      const net_pending = gross - discount - ret - recov;
+      prevPending = net_pending;
+
+      out.push({
+        id: r.id,
+        date: r.date,
+        sale_id: saleId,
+        invoice_no: r.invoice_no,
+        customer_name: r.customer_name,
+        gross_amount: gross,
+        discount: discount,
+        return_amount: ret,
+        recovered_amount: recov,
+        net_pending: net_pending,
+      });
+    }
+  }
+
+  return out;
 }
 
 
@@ -503,8 +540,8 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
     { label: 'Invoice',   w: 52 },
     { label: 'Customer',  w: 'flex' },
     { label: 'Gross',     w: 62, align: 'right' },
-    { label: 'Return',    w: 58, align: 'right' },
-    { label: 'Disc.',     w: 52, align: 'right' },
+    { label: 'Disc.',     w: 58, align: 'right' },
+    { label: 'Return',    w: 52, align: 'right' },
     { label: 'Net',       w: 62, align: 'right' },
     { label: 'Recovered', w: 62, align: 'right' },
   ]);
@@ -526,8 +563,8 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
 
   rows.forEach((row, i) => {
     const gross = parseFloat(row.gross_amount)    || 0;
-    const ret   = parseFloat(row.return_amount)   || 0;
     const disc  = parseFloat(row.discount)        || 0;
+    const ret   = parseFloat(row.return_amount)   || 0;
     const net   = parseFloat(row.net_amount)      || 0;
     const rec   = parseFloat(row.recovered_amount)|| 0;
     totals.gross += gross; totals.ret += ret; totals.disc += disc;
@@ -538,8 +575,8 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
     const invoiceStr = row.invoice_no    || '—';
     const custStr    = row.customer_name || '—';
     const grossStr   = gross.toFixed(2);
-    const retStr     = ret  > 0 ? ret.toFixed(2)  : '—';
     const discStr    = disc > 0 ? disc.toFixed(2) : '—';
+    const retStr     = ret  > 0 ? ret.toFixed(2)  : '—';
     const netStr     = net.toFixed(2);
     const recStr     = rec  > 0 ? rec.toFixed(2)  : '—';
 
@@ -565,8 +602,8 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
     doc.text(invoiceStr, cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
     doc.text(custStr,    cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4 }); // wraps freely
     doc.text(grossStr,   cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
-    doc.text(retStr,     cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-    doc.text(discStr,    cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+    doc.text(discStr,    cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+    doc.text(retStr,     cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
     doc.text(netStr,     cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
     doc.text(recStr,     cols[8].x + 2, y + TABLE_TOP_PAD, { width: cols[8].w - 4, align: 'right', lineBreak: false });
     y += rowH;
@@ -579,8 +616,8 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
   doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
   doc.text('TOTAL',                  cols[3].x + 2, y, { width: cols[3].w - 4,  lineBreak: false });
   doc.text(totals.gross.toFixed(2),  cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
-  doc.text(totals.ret.toFixed(2),    cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-  doc.text(totals.disc.toFixed(2),   cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.disc.toFixed(2),   cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.ret.toFixed(2),    cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
   doc.text(totals.net.toFixed(2),    cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
   doc.text(totals.rec.toFixed(2),    cols[8].x + 2, y, { width: cols[8].w - 4, align: 'right', lineBreak: false });
 
@@ -612,13 +649,15 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
   });
 
   const cols = buildPdfColumns(left, contentWidth, [
-    { label: 'Sr',         w: 21 },
-    { label: 'Date',       w: 56 },
-    { label: 'Customer',   w: 'flex' },
-    { label: 'Gross',      w: 72, align: 'right' },
-    { label: 'Recovered',  w: 72, align: 'right' },
-    { label: 'Ret / Disc', w: 72, align: 'right' },
-    { label: 'Pending',    w: 72, align: 'right' },
+    { label: 'Sr',             w: 21 },
+    { label: 'Date',           w: 56 },
+    { label: 'Invoice',        w: 60 },
+    { label: 'Customer',       w: 'flex' },
+    { label: 'Gross Pending',  w: 64, align: 'right' },
+    { label: 'Disc.',          w: 58, align: 'right' },
+    { label: 'Return',         w: 58, align: 'right' },
+    { label: 'Recovered',      w: 64, align: 'right' },
+    { label: 'Pending',        w: 72, align: 'right' },
   ]);
 
   const pageBottom = getPdfContentBottom(doc);
@@ -634,21 +673,24 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
   }
 
   y = drawHdr(y);
-  const totals = { gross: 0, rec: 0, rd: 0, pending: 0 };
+  const totals = { gross: 0, rec: 0, disc: 0, ret: 0, pending: 0 };
 
   rows.forEach((row, i) => {
     const gross   = parseFloat(row.gross_amount)    || 0;
+    const disc    = parseFloat(row.discount)        || 0;
+    const ret     = parseFloat(row.return_amount)   || 0;
     const rec     = parseFloat(row.recovered_amount)|| 0;
-    const rd      = parseFloat(row.return_discount) || 0;
     const pending = parseFloat(row.net_pending)     || 0;
-    totals.gross += gross; totals.rec += rec; totals.rd += rd; totals.pending += pending;
+    totals.gross += gross; totals.rec += rec; totals.ret += ret; totals.disc += disc; totals.pending += pending;
 
     const srStr      = String(i + 1);
     const dateStr    = formatDatePKT(row.date);
+    const invoiceStr = row.invoice_no || '—';
     const custStr    = row.customer_name || '—';
     const grossStr   = gross.toFixed(2);
+    const discStr    = disc > 0 ? disc.toFixed(2) : '—';
+    const retStr     = ret  > 0 ? ret.toFixed(2)  : '—';
     const recStr     = rec.toFixed(2);
-    const rdStr      = rd > 0 ? rd.toFixed(2) : '—';
     const pendingStr = pending.toFixed(2);
 
     // Must set font before measuring
@@ -656,11 +698,13 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
     const rowH = measureRowHeight(doc, [
       { text: srStr,      width: cols[0].w - 4 },
       { text: dateStr,    width: cols[1].w - 4 },
-      { text: custStr,    width: cols[2].w - 4 },  // flex col – most likely to wrap
-      { text: grossStr,   width: cols[3].w - 4 },
-      { text: recStr,     width: cols[4].w - 4 },
-      { text: rdStr,      width: cols[5].w - 4 },
-      { text: pendingStr, width: cols[6].w - 4 },
+      { text: invoiceStr, width: cols[2].w - 4 },
+      { text: custStr,    width: cols[3].w - 4 },  // flex col – most likely to wrap
+      { text: grossStr,   width: cols[4].w - 4 },
+      { text: discStr,    width: cols[5].w - 4 },
+      { text: retStr,     width: cols[6].w - 4 },
+      { text: recStr,     width: cols[7].w - 4 },
+      { text: pendingStr, width: cols[8].w - 4 },
     ], TABLE_MIN_ROW);
 
     if (y + rowH > pageBottom) { doc.addPage(); y = doc.page.margins.top; y = drawHdr(y); }
@@ -668,11 +712,13 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
     doc.text(srStr,      cols[0].x + 2, y + TABLE_TOP_PAD, { width: cols[0].w - 4, lineBreak: false });
     doc.text(dateStr,    cols[1].x + 2, y + TABLE_TOP_PAD, { width: cols[1].w - 4, lineBreak: false });
-    doc.text(custStr,    cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4 }); // wraps freely
-    doc.text(grossStr,   cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4, align: 'right', lineBreak: false });
-    doc.text(recStr,     cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
-    doc.text(rdStr,      cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-    doc.text(pendingStr, cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+    doc.text(invoiceStr, cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
+    doc.text(custStr,    cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4 }); // wraps freely
+    doc.text(grossStr,   cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+    doc.text(discStr,    cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+    doc.text(retStr,     cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+    doc.text(recStr,     cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+    doc.text(pendingStr, cols[8].x + 2, y + TABLE_TOP_PAD, { width: cols[8].w - 4, align: 'right', lineBreak: false });
     y += rowH;
   });
 
@@ -681,11 +727,12 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
   y = ensureSpace(doc, y, 24);
 
   doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
-  doc.text('TOTAL',                    cols[2].x + 2, y, { width: cols[2].w - 4,  lineBreak: false });
-  doc.text(totals.gross.toFixed(2),    cols[3].x + 2, y, { width: cols[3].w - 4, align: 'right', lineBreak: false });
-  doc.text(totals.rec.toFixed(2),      cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
-  doc.text(totals.rd.toFixed(2),       cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-  doc.text(totals.pending.toFixed(2),  cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text('TOTAL',                    cols[3].x + 2, y, { width: cols[3].w - 4,  lineBreak: false });
+  doc.text(totals.gross.toFixed(2),    cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.disc.toFixed(2),     cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.ret.toFixed(2),      cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.rec.toFixed(2),      cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.pending.toFixed(2),  cols[8].x + 2, y, { width: cols[8].w - 4, align: 'right', lineBreak: false });
 
   stampPdfFootersOnAllPages(doc, footerOpts);
   doc.flushPages();
@@ -774,10 +821,10 @@ async function fetchSaleSummaryData({ from_date, to_date, layers }) {
     sql = `
       SELECT
         ${selectCols},
-        SUM(s.total_amount + s.total_return_amount + s.total_discount) AS gross_amount,
+        SUM(s.total_amount - s.total_return_amount - s.total_discount) AS net_amount,
         SUM(s.total_return_amount) AS return_amount,
         SUM(s.total_discount) AS discount,
-        SUM(s.total_amount) AS net_amount,
+        SUM(s.total_amount) AS gross_amount,
         SUM(s.total_recovered) AS recovered_amount
       FROM sales s
       JOIN customers c ON s.customer_id = c.id
@@ -901,16 +948,16 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   const REDUCTION = 0.85; // amount columns are 85% of their earlier width
   const amtWidth = {
     gross: Math.round(contentWidth * 0.115 * REDUCTION),
-    ret:   Math.round(contentWidth * 0.105 * REDUCTION),
+    disc:  Math.round(contentWidth * 0.105 * REDUCTION),
+    ret:   Math.round(contentWidth * 0.095 * REDUCTION),
     net:   Math.round(contentWidth * 0.115 * REDUCTION),
-    disc:  Math.round(contentWidth * 0.09  * REDUCTION),
   };
   // Sr: measured to comfortably fit a 3-digit serial number (up to 999 rows)
   // instead of the 2-digit-only width it had before.
   doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
   const srWidth = Math.ceil(doc.widthOfString('888')) + 8;
 
-  const amtFixedSum = srWidth + amtWidth.gross + amtWidth.ret + amtWidth.net + amtWidth.disc;
+  const amtFixedSum = srWidth + amtWidth.gross + amtWidth.disc + amtWidth.ret + amtWidth.net;
   // "Recovered" is the longest header word among the amount columns, so it
   // keeps a slightly larger reservation to stay on one line.
   const RECOVERED_MIN = Math.round(contentWidth * 0.125 * REDUCTION);
@@ -948,7 +995,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
 
   // Recovered gets whatever's left so columns sum to EXACTLY contentWidth —
   // this is what makes the "off the page" bug structurally impossible.
-  const usedSoFar = srWidth + layerColWidths.reduce((a, b) => a + b, 0) + amtWidth.gross + amtWidth.ret + amtWidth.net + amtWidth.disc;
+  const usedSoFar = srWidth + layerColWidths.reduce((a, b) => a + b, 0) + amtWidth.gross + amtWidth.disc + amtWidth.ret + amtWidth.net;
   amtWidth.rec = contentWidth - usedSoFar;
 
   // Build column x-positions left to right.
@@ -960,9 +1007,9 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     cx += layerColWidths[i];
   });
   cols.push({ key: 'gross', label: 'Gross',     x: cx, w: amtWidth.gross, align: 'right' }); cx += amtWidth.gross;
+  cols.push({ key: 'disc',  label: 'Disc',      x: cx, w: amtWidth.disc,  align: 'right' }); cx += amtWidth.disc;
   cols.push({ key: 'ret',   label: 'Return',    x: cx, w: amtWidth.ret,   align: 'right' }); cx += amtWidth.ret;
   cols.push({ key: 'net',   label: 'Net',       x: cx, w: amtWidth.net,   align: 'right' }); cx += amtWidth.net;
-  cols.push({ key: 'disc',  label: 'Dis',       x: cx, w: amtWidth.disc,  align: 'right' }); cx += amtWidth.disc;
   cols.push({ key: 'rec',   label: 'Recovered', x: cx, w: amtWidth.rec,   align: 'right' }); cx += amtWidth.rec;
 
   const layerColStart = 1;               // index of first layer column in `cols`
@@ -1032,9 +1079,9 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   function amountStrs(gross, ret, net, disc, rec) {
     return {
       grossStr: fmtAmt(gross),
+      discStr:  disc > 0 ? fmtAmt(disc) : '\u2014',
       retStr:   ret  > 0 ? fmtAmt(ret)  : '\u2014',
       netStr:   fmtAmt(net),
-      discStr:  disc > 0 ? fmtAmt(disc) : '\u2014',
       recStr:   rec  > 0 ? fmtAmt(rec)  : '\u2014',
     };
   }
@@ -1056,16 +1103,16 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
 
     const srStr = String(r + 1);
     let layerCells = buildLayerCells(r, forcedReopen);
-    const { grossStr, retStr, netStr, discStr, recStr } = amountStrs(gross, ret, net, disc, rec);
+    const { grossStr, discStr, retStr, netStr, recStr } = amountStrs(gross, ret, net, disc, rec);
 
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
     let measureCells = [
       { text: srStr, width: cols[0].w - 8 },
       ...layerCells.map((s, li) => ({ text: s, width: cols[layerColStart + li].w - 8 })),
       { text: grossStr, width: cols[amtColStart].w - 8 },
-      { text: retStr,   width: cols[amtColStart + 1].w - 8 },
-      { text: netStr,   width: cols[amtColStart + 2].w - 8 },
-      { text: discStr,  width: cols[amtColStart + 3].w - 8 },
+      { text: discStr,  width: cols[amtColStart + 1].w - 8 },
+      { text: retStr,   width: cols[amtColStart + 2].w - 8 },
+      { text: netStr,   width: cols[amtColStart + 3].w - 8 },
       { text: recStr,   width: cols[amtColStart + 4].w - 8 },
     ];
     let rowH = measureRowHeight(doc, measureCells, TABLE_MIN_ROW);
@@ -1094,9 +1141,9 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
         { text: srStr, width: cols[0].w - 8 },
         ...layerCells.map((s, li) => ({ text: s, width: cols[layerColStart + li].w - 8 })),
         { text: grossStr, width: cols[amtColStart].w - 8 },
-        { text: retStr,   width: cols[amtColStart + 1].w - 8 },
-        { text: netStr,   width: cols[amtColStart + 2].w - 8 },
-        { text: discStr,  width: cols[amtColStart + 3].w - 8 },
+        { text: discStr,  width: cols[amtColStart + 1].w - 8 },
+        { text: retStr,   width: cols[amtColStart + 2].w - 8 },
+        { text: netStr,   width: cols[amtColStart + 3].w - 8 },
         { text: recStr,   width: cols[amtColStart + 4].w - 8 },
       ];
       rowH = measureRowHeight(doc, measureCells, TABLE_MIN_ROW);
@@ -1113,9 +1160,9 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     });
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
     doc.text(grossStr, cols[amtColStart].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart].w - 8, align: 'right', lineBreak: false });
-    doc.text(retStr,   cols[amtColStart + 1].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 1].w - 8, align: 'right', lineBreak: false });
-    doc.text(netStr,   cols[amtColStart + 2].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 2].w - 8, align: 'right', lineBreak: false });
-    doc.text(discStr,  cols[amtColStart + 3].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 3].w - 8, align: 'right', lineBreak: false });
+    doc.text(discStr,  cols[amtColStart + 1].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 1].w - 8, align: 'right', lineBreak: false });
+    doc.text(retStr,   cols[amtColStart + 2].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 2].w - 8, align: 'right', lineBreak: false });
+    doc.text(netStr,   cols[amtColStart + 3].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 3].w - 8, align: 'right', lineBreak: false });
     doc.text(recStr,   cols[amtColStart + 4].x + 4, y + TABLE_TOP_PAD, { width: cols[amtColStart + 4].w - 8, align: 'right', lineBreak: false });
 
     // Vertical grid for this row's full height, always.
@@ -1147,9 +1194,9 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   const totalLabelWidth = cols[amtColStart].x - cols[0].x;
   doc.text('GRAND TOTAL', cols[0].x + 4, y, { width: totalLabelWidth - 8, lineBreak: false });
   doc.text(gt.grossStr, cols[amtColStart].x + 4, y, { width: cols[amtColStart].w - 8, align: 'right', lineBreak: false });
-  doc.text(gt.retStr,   cols[amtColStart + 1].x + 4, y, { width: cols[amtColStart + 1].w - 8, align: 'right', lineBreak: false });
-  doc.text(gt.netStr,   cols[amtColStart + 2].x + 4, y, { width: cols[amtColStart + 2].w - 8, align: 'right', lineBreak: false });
-  doc.text(gt.discStr,  cols[amtColStart + 3].x + 4, y, { width: cols[amtColStart + 3].w - 8, align: 'right', lineBreak: false });
+  doc.text(gt.discStr,  cols[amtColStart + 1].x + 4, y, { width: cols[amtColStart + 1].w - 8, align: 'right', lineBreak: false });
+  doc.text(gt.retStr,   cols[amtColStart + 2].x + 4, y, { width: cols[amtColStart + 2].w - 8, align: 'right', lineBreak: false });
+  doc.text(gt.netStr,   cols[amtColStart + 3].x + 4, y, { width: cols[amtColStart + 3].w - 8, align: 'right', lineBreak: false });
   doc.text(gt.recStr,   cols[amtColStart + 4].x + 4, y, { width: cols[amtColStart + 4].w - 8, align: 'right', lineBreak: false });
 
   stampPdfFootersOnAllPages(doc, footerOpts);
