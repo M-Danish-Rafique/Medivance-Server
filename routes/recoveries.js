@@ -8,18 +8,27 @@ const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
 // ── Shared return-line classification + application ─────────────────────────
 // Used by both POST / (new recovery) and PUT /:id (admin edit). A return line
 // can settle in exactly one of three ways, decided purely by the SOURCE
-// invoice's own state (never by which tab it was entered from):
+// invoice's own state relative to the invoice CURRENTLY being settled (never
+// by which tab it was entered from):
 //
-//   'shrink'          source invoice was never locked (no recovery event has
-//                      ever happened against it) — safe to rewrite its own
-//                      sale_items/total_amount directly, same as editing the
-//                      sale before any payment.
-//   'credit'          source invoice is locked AND is either (a) the same
-//                      invoice currently being settled, or (b) a different
-//                      invoice that is already recovery_status='completed'.
+//   'shrink'          source invoice is a DIFFERENT invoice from the one
+//                      currently being settled, AND it was never locked (no
+//                      recovery event has ever happened against it) —
+//                      it's safe to rewrite its own sale_items/total_amount
+//                      directly, same as editing the sale before any payment.
+//                      The invoice currently being settled is NEVER shrunk,
+//                      even if it is itself still open/unlocked at the time
+//                      this recovery event is being recorded — the Recovery
+//                      module is not permitted to rewrite invoice qty/total;
+//                      any return against the current invoice is always
+//                      recorded as a credit note instead (see 'credit' below).
+//   'credit'          EITHER (a) the source invoice is the CURRENT invoice
+//                      being settled — regardless of lock state — or (b) the
+//                      source invoice is a different invoice that is locked
+//                      AND already recovery_status='completed'.
 //                      Reduces the CURRENT invoice's own total_return_amount /
 //                      net_collectible / pending_amount (a credit note).
-//   'source_pending'  source invoice is locked, is a DIFFERENT invoice, and
+//   'source_pending'  source invoice is a DIFFERENT invoice, is locked, and
 //                      is still recovery_status='pending'. Reduces THAT
 //                      invoice's own pending balance only — capped at what's
 //                      still pending on it — and never touches the invoice
@@ -29,8 +38,9 @@ const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
 // (sale_items.qty - total already returned against that sale_item across all
 // history). Because a sale_item only ever accumulates return_items rows once
 // its invoice has been locked (a return can only happen via a recovery
-// event, which locks the invoice), sale_items.qty is guaranteed to still be
-// the original sold qty whenever that subtraction matters.
+// event, which locks the invoice) — EXCEPT for the current invoice, which
+// never shrinks — sale_items.qty is guaranteed to still be the original sold
+// qty whenever the 'shrink' branch's subtraction matters.
 //
 // classifyReturnLine does validation only (no writes) so callers can compute
 // event-level totals (e.g. how much of this event's returns count toward the
@@ -67,9 +77,17 @@ async function classifyReturnLine(conn, item, currentSale) {
 
   const isCurrentInvoice = srcSale.id === currentSale.id;
   let branch;
-  if (!srcSale.is_locked) {
+  if (isCurrentInvoice) {
+    // The invoice being settled in THIS recovery event is never edited by a
+    // return — whether it's locked or still open. The Recovery module is not
+    // permitted to rewrite an invoice's sold qty/total. A return against the
+    // current invoice is always recorded as a credit note (it reduces this
+    // invoice's own net_collectible / pending_amount), never as a
+    // sale_items qty/total rewrite.
+    branch = 'credit';
+  } else if (!srcSale.is_locked) {
     branch = 'shrink';
-  } else if (isCurrentInvoice || srcSale.recovery_status === 'completed') {
+  } else if (srcSale.recovery_status === 'completed') {
     branch = 'credit';
   } else {
     const srcPendingBefore = parseFloat(srcSale.pending_amount || 0);
@@ -525,10 +543,11 @@ router.post('/', auth, async (req, res) => {
     const eventReturnAmount = classifiedReturns
       .filter(c => c.branch === 'credit')
       .reduce((s, c) => s + c.retAmt, 0);
-    // A 'shrink' return on the CURRENT invoice's own items (its first-ever
-    // recovery event, before locking) reduces total_amount directly via
-    // applyReturnLine — account for that here so net_collectible reflects the
-    // post-shrink total rather than the stale pre-shrink figure.
+    // The current invoice is never shrunk (see classifyReturnLine), so there is
+    // no self-shrink amount to fold into effectiveTotalAmount below. This stays
+    // at 0 and effectiveTotalAmount always equals currentSale.total_amount —
+    // kept as an explicit variable (rather than removed) so the net_collectible
+    // formula below reads the same as it always has.
     const selfShrinkAmount = classifiedReturns
       .filter(c => c.branch === 'shrink' && c.isCurrentInvoice)
       .reduce((s, c) => s + c.retAmt, 0);
@@ -735,7 +754,9 @@ router.put('/:id', auth, async (req, res) => {
 
       if (old.settlement_branch === 'shrink') {
         // Restore the source invoice's sale_item qty/total, its rollup
-        // columns, and its own ledger DR row.
+        // columns, and its own ledger DR row. (Historical rows only — the
+        // current invoice can no longer produce a new 'shrink' return, but
+        // old rows written before this fix must still revert correctly.)
         const [siRows] = await conn.query('SELECT * FROM sale_items WHERE id=?', [old.sale_item_id]);
         if (siRows.length) {
           const si = siRows[0];
@@ -783,9 +804,11 @@ router.put('/:id', auth, async (req, res) => {
     }
 
     // The invoice being edited may itself have been the target of one of the
-    // "unlocked branch" reverts above (possible when a same-invoice return was
-    // recorded on the invoice's very first — and therefore still-unlocked-at-the-
-    // time — recovery event). Re-read its total_amount so later math is correct.
+    // "unlocked branch" reverts above (only possible for historical rows written
+    // before the current-invoice-never-shrinks fix, when a same-invoice return
+    // could still be recorded on the invoice's very first — and therefore
+    // still-unlocked-at-the-time — recovery event). Re-read its total_amount so
+    // later math is correct.
     const [freshSaleRows] = await conn.query('SELECT total_amount FROM sales WHERE id=?', [saleId]);
     currentSale.total_amount = freshSaleRows[0].total_amount;
 
