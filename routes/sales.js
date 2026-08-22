@@ -136,9 +136,27 @@ async function restoreInventory(conn, {
 
 router.get('/', auth, async (req, res) => {
   try {
+    // Optional `print_status` filter used by the Bulk Print flow — kept
+    // server-side so future paginated loads can push the filter down
+    // instead of trimming the payload on the client. Default 'all' keeps
+    // the existing Sales page behaviour unchanged.
+    const printStatus = String(req.query.print_status || 'all').toLowerCase();
+    let printFilterSql = '';
+    if (printStatus === 'unprinted')    printFilterSql = 'WHERE s.printed_at IS NULL';
+    else if (printStatus === 'printed') printFilterSql = 'WHERE s.printed_at IS NOT NULL';
+
+    // s.* already surfaces the new printed_at / last_printed_type /
+    // last_printed_by columns added by the 2026-08-22_bulk_print
+    // migration, so the client doesn't need extra joins for the
+    // "Printed as … on <date>" chip.
+    //
+    // c.is_licensed is included so the Bulk Print flow can compute its
+    // per-invoice "smart default" type (licensed → warranty, non-licensed
+    // → non-warranty) client-side without a second round-trip.
     const [rows] = await db.query(`
       SELECT s.*, DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
-             c.name as customer_name, e.name as salesman_name,
+             c.name as customer_name, c.is_licensed,
+             e.name as salesman_name,
              d.name as delivery_by_name,
              ci.name as city_name, a.name as area_name, t.name as territory_name,
              (SELECT GROUP_CONCAT(DISTINCT si.product_id) FROM sale_items si WHERE si.sale_id = s.id) as product_ids
@@ -149,6 +167,7 @@ router.get('/', auth, async (req, res) => {
       LEFT JOIN cities ci ON c.city_id=ci.id
       LEFT JOIN areas a ON c.area_id=a.id
       LEFT JOIN territories t ON c.territory_id=t.id
+      ${printFilterSql}
       ORDER BY s.date DESC, s.id DESC
     `);
     res.json(rows);
@@ -194,10 +213,14 @@ router.get('/history/rates', auth, async (req, res) => {
 // Get single sale with items
 router.get('/:id', auth, async (req, res) => {
   try {
+    // `c.is_licensed` is what the Bulk Print flow uses to resolve the
+    // "smart default" invoice type per-invoice (licensed → warranty,
+    // non-licensed → non-warranty). Same rule the print_queue seed used
+    // before it was removed.
     const [rows] = await db.query(`
       SELECT s.*, DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
              c.name as customer_name, c.address as customer_address, c.phone as customer_phone,
-             c.license_no, c.license_expiry,
+             c.license_no, c.license_expiry, c.is_licensed,
              e.name as salesman_name,
              d.name as delivery_by_name,
              ci.name as city_name, a.name as area_name, t.name as territory_name
@@ -309,7 +332,7 @@ router.post('/', auth, async (req, res) => {
     await conn.query('UPDATE customers SET balance=balance+? WHERE id=?',
       [total_amount, customer_id]);
     const [custRows] = await conn.query(
-      'SELECT balance, name, is_licensed FROM customers WHERE id=?', [customer_id]);
+      'SELECT balance FROM customers WHERE id=?', [customer_id]);
     const newBalance = custRows[0].balance;
     await conn.query(
       `INSERT INTO customer_ledger
@@ -319,18 +342,12 @@ router.post('/', auth, async (req, res) => {
       [customer_id, date, invoice_no, 'Sale', total_amount, 0, newBalance, 'sale', sId]
     );
 
-    // Print queue seed. Default type: Licensed customers -> Warranty,
-    // Non-Licensed -> Non-Warranty. User can edit later.
-    const safeCustomerName = String(custRows[0].name || 'Customer')
-      .replace(/[\\/:*?"<>|]+/g, '').trim() || 'Customer';
-    const defaultPdfName = `${invoice_no}_${safeCustomerName}_${customer_id}.pdf`;
-    const defaultInvoiceType = custRows[0].is_licensed ? 'warranty' : 'non-warranty';
-    await conn.query(
-      `INSERT INTO print_queue
-         (sale_id, invoice_no, pdf_name, invoice_type, is_selected)
-       VALUES (?,?,?,?,1)`,
-      [sId, invoice_no, defaultPdfName, defaultInvoiceType]
-    );
+    // NOTE: The 2026-08-22 Bulk Print refactor removed the print_queue
+    // seed that used to live here. New invoices default to "unprinted"
+    // (sales.printed_at IS NULL) and appear at the top of the Sales list;
+    // operators either print them one-off from the row action or select
+    // them into the Bulk Print flow. See the migration header for the
+    // rationale.
 
     // Tax ledger for taxable manufactured products only. This intentionally
     // uses products.tax_applicable / products.sale_tax_pct rather than the
@@ -548,6 +565,70 @@ router.delete('/:id', auth, async (req, res) => {
     await conn.commit();
     await logAudit(req, 'DELETE', 'sale', req.params.id, `Deleted invoice ${sale.invoice_no}`);
     res.json({ message: 'Sale deleted' });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(err.status || 500).json({ message: err.message });
+  } finally { conn.release(); }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POST /mark-printed — stamp a batch of invoices as printed
+// ───────────────────────────────────────────────────────────────────────────
+// Called by the Bulk Print preview (frontend/BatchPrint.js) on the
+// browser's `afterprint` event, once per resolved invoice_type in the
+// batch. Idempotent: a second call on the same ids just updates
+// printed_at to the newer timestamp and overwrites last_printed_type /
+// last_printed_by — which is the desired behaviour for reprints.
+//
+// Batch cap of 200 mirrors the frontend hard-cap; the soft-warn at 50
+// lives only on the client. Ids that no longer exist (deleted between
+// selection and print) are silently ignored so a race can't 500 the
+// call.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PRINT_TYPES = ['warranty', 'warranty10', 'non-warranty'];
+const MARK_PRINTED_CAP = 200;
+
+router.post('/mark-printed', auth, async (req, res) => {
+  const { ids, type } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: 'ids must be a non-empty array' });
+  }
+  if (ids.length > MARK_PRINTED_CAP) {
+    return res.status(400).json({
+      message: `Batch cap is ${MARK_PRINTED_CAP} invoices per mark-printed call.`
+    });
+  }
+  const numericIds = ids
+    .map(id => parseInt(id, 10))
+    .filter(n => Number.isFinite(n) && n > 0);
+  if (numericIds.length === 0) {
+    return res.status(400).json({ message: 'No valid ids provided.' });
+  }
+  if (!PRINT_TYPES.includes(type)) {
+    return res.status(400).json({
+      message: `Invalid invoice type. Expected one of: ${PRINT_TYPES.join(', ')}.`
+    });
+  }
+
+  const conn = await db.getConnection();
+  await conn.beginTransaction();
+  try {
+    const placeholders = numericIds.map(() => '?').join(',');
+    const [result] = await conn.query(
+      `UPDATE sales
+         SET printed_at=NOW(),
+             last_printed_type=?,
+             last_printed_by=?
+       WHERE id IN (${placeholders})`,
+      [type, req.user?.id || null, ...numericIds]
+    );
+    await conn.commit();
+    await logAudit(req, 'PRINT', 'sale', null,
+      `Marked ${result.affectedRows} invoice(s) as printed (${type})`);
+    res.json({ marked: result.affectedRows });
   } catch (err) {
     await conn.rollback();
     console.error(err);
