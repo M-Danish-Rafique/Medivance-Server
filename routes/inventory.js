@@ -16,6 +16,35 @@ const {
 } = require('../utils/pdfHelpers');
 const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
 
+// Paisa tolerance & 4-decimal rounding (matches purchase.js & sales.js).
+const PAISA  = 0.005;
+const money4 = (n) => Math.round(parseFloat(n || 0) * 10000) / 10000;
+
+// Admin-aware wrapper around sanitizeInventoryRows. Admins always see
+// purchase_rate regardless of products.show_purchase_rate — matches the
+// frontend's `user?.role === 'admin' || can(perm_view_purchase_rate)`
+// pattern in Sale.js / Purchase.js / Inventory.js / Products.js.
+async function sanitizeInventoryRowsWithAdminBypass(req, dbConn, rows) {
+  if (req.user?.role === 'admin') return rows;
+  return sanitizeInventoryRows(req, dbConn, rows);
+}
+
+// One-line journal helper. `refType` uses the enum shipped with the
+// migration: 'purchase' | 'sale' | 'return' | 'inventory_manual' |
+// 'manufacturing' | 'adjustment'.
+async function recordInventoryMovement(conn, {
+  productId, batchNo, date, refType, refId, qtyIn, qtyOut, rateAtMovement, note,
+}) {
+  await conn.query(
+    `INSERT INTO inventory_movements
+       (product_id, batch_no, movement_date, ref_type, ref_id,
+        qty_in, qty_out, rate_at_movement, note)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [productId, batchNo || '', date, refType, refId,
+     qtyIn || 0, qtyOut || 0, rateAtMovement ?? null, note || null]
+  );
+}
+
 // ─── Shared PDF constants (matches Ledger/Sales/Recovery report typography) ──
 const TABLE_FONT_SIZE     = 8.5;
 const TABLE_HDR_FONT_SIZE = 8.5;
@@ -66,7 +95,7 @@ router.get('/', auth, async (req, res) => {
       LEFT JOIN companies c ON p.company_id = c.id
       ORDER BY p.name, i.batch_no
     `);
-    const payload = await sanitizeInventoryRows(req, db, rows);
+    const payload = await sanitizeInventoryRowsWithAdminBypass(req, db, rows);
     res.json(payload);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -80,7 +109,7 @@ router.get('/low-stock', auth, async (req, res) => {
       WHERE i.qty <= i.low_stock_threshold AND i.qty > 0
       ORDER BY i.qty ASC
     `);
-    const payload = await sanitizeInventoryRows(req, db, rows);
+    const payload = await sanitizeInventoryRowsWithAdminBypass(req, db, rows);
     res.json(payload);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -110,7 +139,7 @@ router.get('/product/:product_id', auth, async (req, res) => {
     // this filter only applies when explicitly requested.
     const { active_only } = req.query;
     const filtered = active_only ? rows.filter(isBatchActive) : rows;
-    const payload = await sanitizeInventoryRows(req, db, filtered);
+    const payload = await sanitizeInventoryRowsWithAdminBypass(req, db, filtered);
     res.json(payload);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -123,6 +152,35 @@ router.get('/check-batch', auth, async (req, res) => {
       [product_id, batch_no]
     );
     res.json(rows.length > 0 ? rows[0] : null);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Batch lookup used by the Inventory manual-add form. If the (product,
+// batch) pair already exists in inventory, the response includes every
+// field the form should lock — rate/exp/sale/retail all come from the
+// existing row, only qty is left for the operator to input. Admins get
+// the same lock (business rule, not a permission thing).
+router.get('/batch-lookup', auth, async (req, res) => {
+  try {
+    const { product_id, batch_no } = req.query;
+    if (!product_id || !batch_no) return res.json({ exists: false });
+    const [rows] = await db.query(
+      `SELECT id, qty, purchase_rate, sale_rate, retail_price, exp_date,
+              low_stock_threshold
+         FROM inventory WHERE product_id=? AND batch_no=?`,
+      [product_id, batch_no]
+    );
+    if (!rows.length) return res.json({ exists: false });
+    const row = rows[0];
+    res.json({
+      exists: true,
+      qty:                 parseInt(row.qty, 10),
+      purchase_rate:       parseFloat(row.purchase_rate),
+      sale_rate:           parseFloat(row.sale_rate),
+      retail_price:        parseFloat(row.retail_price),
+      exp_date:            row.exp_date,
+      low_stock_threshold: row.low_stock_threshold,
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -162,9 +220,17 @@ router.get('/print/pdf', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// Manual inventory entry — used to migrate stock from a previous system.
-// Unlike POST /purchases, this ONLY writes to the inventory table: no purchase /
-// purchase_items record is created, and no supplier ledger / balance is touched.
+// Manual inventory entry — used to migrate stock from a previous system
+// and to top up existing batches without going through Purchase.
+//
+// Rule when the (product, batch) pair ALREADY exists in inventory: only
+// the qty is user-editable. Rate, expiry, sale rate, and retail price
+// come from the existing inventory row and are enforced server-side
+// regardless of what the client sent — protects against an operator
+// silently overwriting a batch's rate via the manual-add form.
+// (See Q6 in the audit: rate changes on an existing batch must go
+// through Purchase with the weighted-average preview, or through the
+// Inventory Edit modal with an explicit rate-change confirmation.)
 router.post('/manual', auth, async (req, res) => {
   const conn = await db.getConnection();
   await conn.beginTransaction();
@@ -179,54 +245,68 @@ router.post('/manual', auth, async (req, res) => {
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       const rowNum = i + 1;
-      const { product_id, batch_no, qty, purchase_rate, sale_rate, retail_price, exp_date, low_stock_threshold } = item;
+      const { product_id, batch_no, qty } = item;
 
       if (!product_id || !batch_no) {
         throw new Error(`Row ${rowNum}: Product and Batch No are required`);
       }
-      if (!qty || parseFloat(qty) <= 0) {
+      const addQty = parseFloat(qty);
+      if (!addQty || addQty <= 0) {
         throw new Error(`Row ${rowNum}: Qty must be greater than 0`);
       }
 
       const [existing] = await conn.query(
-        'SELECT * FROM inventory WHERE product_id=? AND batch_no=?',
+        'SELECT * FROM inventory WHERE product_id=? AND batch_no=? FOR UPDATE',
         [product_id, batch_no]
       );
 
       if (existing.length > 0) {
-        // Batch already exists — add the migrated qty on top rather than overwrite it
+        // Existing batch — lock the rate/exp fields to what's already in
+        // inventory. Any values the client tried to send are DISCARDED.
+        const existingRow = existing[0];
         await conn.query(
           `UPDATE inventory
-           SET qty = qty + ?,
-               purchase_rate = ?,
-               sale_rate = ?,
-               retail_price = ?,
-               exp_date = ?,
-               low_stock_threshold = COALESCE(?, low_stock_threshold),
-               updated_at = NOW()
-           WHERE product_id=? AND batch_no=?`,
-          [
-            qty,
-            purchase_rate || existing[0].purchase_rate,
-            sale_rate || existing[0].sale_rate,
-            retail_price || existing[0].retail_price,
-            exp_date || existing[0].exp_date,
-            low_stock_threshold || null,
-            product_id, batch_no
-          ]
+             SET qty = qty + ?,
+                 updated_at = NOW()
+           WHERE id=?`,
+          [addQty, existingRow.id]
         );
-        results.push({ product_id, batch_no, action: 'updated' });
+        await recordInventoryMovement(conn, {
+          productId:      product_id,
+          batchNo:        batch_no,
+          date:           todayPKT(),
+          refType:        'inventory_manual',
+          refId:          existingRow.id,
+          qtyIn:          addQty,
+          qtyOut:         0,
+          rateAtMovement: existingRow.purchase_rate,
+          note:           'Manual add — existing batch top-up (rate/exp locked)',
+        });
+        results.push({ product_id, batch_no, action: 'topped_up',
+                       new_qty: parseInt(existingRow.qty, 10) + addQty });
       } else {
-        await conn.query(
+        const { purchase_rate, sale_rate, retail_price, exp_date, low_stock_threshold } = item;
+        const [insertResult] = await conn.query(
           `INSERT INTO inventory
-           (product_id, batch_no, qty, purchase_rate, sale_rate, retail_price, exp_date, low_stock_threshold)
+             (product_id, batch_no, qty, purchase_rate, sale_rate, retail_price, exp_date, low_stock_threshold)
            VALUES (?,?,?,?,?,?,?,?)`,
           [
-            product_id, batch_no, qty,
+            product_id, batch_no, addQty,
             purchase_rate || 0, sale_rate || 0, retail_price || 0,
             exp_date || null, low_stock_threshold || 10
           ]
         );
+        await recordInventoryMovement(conn, {
+          productId:      product_id,
+          batchNo:        batch_no,
+          date:           todayPKT(),
+          refType:        'inventory_manual',
+          refId:          insertResult.insertId,
+          qtyIn:          addQty,
+          qtyOut:         0,
+          rateAtMovement: purchase_rate || null,
+          note:           'Manual add — new batch',
+        });
         results.push({ product_id, batch_no, action: 'created' });
       }
     }
@@ -239,22 +319,35 @@ router.post('/manual', auth, async (req, res) => {
     res.status(201).json({ message: 'Inventory added successfully', results });
   } catch (err) {
     await conn.rollback();
-    res.status(500).json({ message: err.message });
+    res.status(err.status || 500).json({ message: err.message });
   } finally {
     conn.release();
   }
 });
 
 // Edit / update an existing inventory batch.
-// Only batch_no, qty, exp_date, sale_rate, retail_price, and low_stock_threshold
-// are editable. product_id and purchase_rate can never be changed from here.
+//
+// All fields are editable INCLUDING purchase_rate (previously locked —
+// but per Q6, admins need to be able to correct a landed cost when a
+// vendor invoice is amended, and this is the surgical path for that).
+// Any change to purchase_rate / sale_rate / retail_price requires the
+// client to send `confirm_rate_change: true` in the body — without it,
+// the server responds 409 with the current values so the UI can render
+// a confirmation modal.
 router.put('/:id', auth, async (req, res) => {
+  const conn = await db.getConnection();
+  await conn.beginTransaction();
   try {
     const { id } = req.params;
-    let { batch_no, qty, exp_date, sale_rate, retail_price, low_stock_threshold } = req.body;
+    let {
+      batch_no, qty, exp_date, sale_rate, retail_price, low_stock_threshold,
+      purchase_rate, confirm_rate_change,
+    } = req.body;
 
-    const [existingRows] = await db.query('SELECT * FROM inventory WHERE id=?', [id]);
+    const [existingRows] = await conn.query(
+      'SELECT * FROM inventory WHERE id=? FOR UPDATE', [id]);
     if (existingRows.length === 0) {
+      await conn.rollback();
       return res.status(404).json({ message: 'Inventory batch not found' });
     }
     const existing = existingRows[0];
@@ -262,18 +355,21 @@ router.put('/:id', auth, async (req, res) => {
     // ---- Rule 1: batch_no required & unique per product ----
     batch_no = (batch_no || '').trim();
     if (!batch_no) {
+      await conn.rollback();
       return res.status(400).json({ message: 'Batch No is required' });
     }
-    const [dupe] = await db.query(
+    const [dupe] = await conn.query(
       'SELECT id FROM inventory WHERE product_id=? AND batch_no=? AND id<>?',
       [existing.product_id, batch_no, id]
     );
     if (dupe.length > 0) {
+      await conn.rollback();
       return res.status(400).json({ message: 'Another batch with this Batch No already exists for this product' });
     }
 
-    // ---- Rule 2: qty must be greater than 0 ----
+    // ---- Rule 2: qty must be >= 0 ----
     if (qty === undefined || qty === null || qty === '' || parseFloat(qty) < 0) {
+      await conn.rollback();
       return res.status(400).json({ message: 'Qty must not be less than 0' });
     }
 
@@ -282,30 +378,72 @@ router.put('/:id', auth, async (req, res) => {
       const minExpStr = addMonthsPKT(todayPKT(), 3);
       const expStr = String(exp_date).slice(0, 10);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(expStr)) {
+        await conn.rollback();
         return res.status(400).json({ message: 'Invalid Expiry Date' });
       }
       if (expStr < minExpStr) {
+        await conn.rollback();
         return res.status(400).json({ message: 'Expiry Date must be more than 3 months from today' });
       }
     }
 
     // ---- Rule 4: purchase_rate <= sale_rate <= retail_price ----
-    // purchase_rate itself is never edited here, so we compare against the
-    // authoritative value already stored in the database (never trust a client-sent one).
-    const purchaseRate = parseFloat(existing.purchase_rate) || 0;
-    const saleRate = sale_rate !== undefined && sale_rate !== null && sale_rate !== ''
+    const newPurchaseRate = purchase_rate !== undefined && purchase_rate !== null && purchase_rate !== ''
+      ? parseFloat(purchase_rate) : parseFloat(existing.purchase_rate) || 0;
+    const newSaleRate = sale_rate !== undefined && sale_rate !== null && sale_rate !== ''
       ? parseFloat(sale_rate) : parseFloat(existing.sale_rate) || 0;
-    const retailPrice = retail_price !== undefined && retail_price !== null && retail_price !== ''
+    const newRetailPrice = retail_price !== undefined && retail_price !== null && retail_price !== ''
       ? parseFloat(retail_price) : parseFloat(existing.retail_price) || 0;
 
-    if (isNaN(saleRate) || isNaN(retailPrice)) {
-      return res.status(400).json({ message: 'Sale Rate and Retail Price must be valid numbers' });
+    if (isNaN(newPurchaseRate) || isNaN(newSaleRate) || isNaN(newRetailPrice)) {
+      await conn.rollback();
+      return res.status(400).json({ message: 'Rates must be valid numbers' });
     }
-    if (saleRate < purchaseRate) {
-      return res.status(400).json({ message: `Sale Rate cannot be less than Purchase Rate (${purchaseRate})` });
+    if (newPurchaseRate < 0) {
+      await conn.rollback();
+      return res.status(400).json({ message: 'Purchase Rate cannot be negative' });
     }
-    if (retailPrice < saleRate) {
+    if (newSaleRate < newPurchaseRate) {
+      await conn.rollback();
+      return res.status(400).json({
+        message: `Sale Rate cannot be less than Purchase Rate (${newPurchaseRate})`
+      });
+    }
+    if (newRetailPrice < newSaleRate) {
+      await conn.rollback();
       return res.status(400).json({ message: 'Retail Price cannot be less than Sale Rate' });
+    }
+
+    // ---- Rate-change confirmation gate ----
+    // Any rate that has moved between the existing row and the new payload
+    // triggers the confirmation requirement. UI shows a modal explaining
+    // the change; second submit carries `confirm_rate_change: true`.
+    const purchaseRateChanged = Math.abs(money4(existing.purchase_rate) - money4(newPurchaseRate)) > 0.00005;
+    const saleRateChanged     = Math.abs(parseFloat(existing.sale_rate)     - newSaleRate)     > PAISA;
+    const retailPriceChanged  = Math.abs(parseFloat(existing.retail_price)  - newRetailPrice)  > PAISA;
+    if ((purchaseRateChanged || saleRateChanged || retailPriceChanged) && !confirm_rate_change) {
+      await conn.rollback();
+      return res.status(409).json({
+        message: 'Rate change confirmation required.',
+        requires_confirmation: 'confirm_rate_change',
+        preview: {
+          existing: {
+            purchase_rate: parseFloat(existing.purchase_rate),
+            sale_rate:     parseFloat(existing.sale_rate),
+            retail_price:  parseFloat(existing.retail_price),
+          },
+          new: {
+            purchase_rate: newPurchaseRate,
+            sale_rate:     newSaleRate,
+            retail_price:  newRetailPrice,
+          },
+          changed: {
+            purchase_rate: purchaseRateChanged,
+            sale_rate:     saleRateChanged,
+            retail_price:  retailPriceChanged,
+          },
+        },
+      });
     }
 
     // ---- Rule 5: low_stock_threshold must not be below 1 ----
@@ -313,26 +451,57 @@ router.put('/:id', auth, async (req, res) => {
     if (low_stock_threshold !== undefined && low_stock_threshold !== null && low_stock_threshold !== '') {
       lowStockThreshold = parseInt(low_stock_threshold, 10);
       if (isNaN(lowStockThreshold) || lowStockThreshold < 1) {
+        await conn.rollback();
         return res.status(400).json({ message: 'Low Stock Threshold must be at least 1' });
       }
     }
 
-    await db.query(
+    const newQty = parseInt(qty, 10);
+    const oldQty = parseInt(existing.qty, 10);
+
+    await conn.query(
       `UPDATE inventory
-       SET batch_no=?, qty=?, exp_date=?, sale_rate=?, retail_price=?, low_stock_threshold=?, updated_at=NOW()
+         SET batch_no=?, qty=?, exp_date=?, purchase_rate=?, sale_rate=?, retail_price=?,
+             low_stock_threshold=?, updated_at=NOW()
        WHERE id=?`,
-      [batch_no, qty, exp_date || null, saleRate, retailPrice, lowStockThreshold, id]
+      [batch_no, newQty, exp_date || null,
+       newPurchaseRate, newSaleRate, newRetailPrice,
+       lowStockThreshold, id]
     );
 
+    // Journal the qty delta if it moved. rate_at_movement uses the NEW
+    // rate for a stock-up, the OLD rate for a stock-down (the units
+    // leaving carried the old cost).
+    if (newQty !== oldQty) {
+      const delta = newQty - oldQty;
+      await recordInventoryMovement(conn, {
+        productId: existing.product_id,
+        batchNo:   batch_no,
+        date:      todayPKT(),
+        refType:   'inventory_manual',
+        refId:     parseInt(id, 10),
+        qtyIn:     delta > 0 ? delta  : 0,
+        qtyOut:    delta < 0 ? -delta : 0,
+        rateAtMovement: delta > 0 ? newPurchaseRate : parseFloat(existing.purchase_rate),
+        note:      `Inventory edit — qty ${oldQty} → ${newQty}`,
+      });
+    }
+
+    await conn.commit();
     await logAudit(
       req, 'UPDATE', 'inventory', id,
-      `Updated inventory batch ${batch_no} (qty: ${existing.qty} → ${qty})`
+      `Updated inventory batch ${batch_no} (qty: ${oldQty} → ${newQty}` +
+      (purchaseRateChanged ? `, purchase_rate: ${existing.purchase_rate} → ${newPurchaseRate}` : '') +
+      (saleRateChanged     ? `, sale_rate: ${existing.sale_rate} → ${newSaleRate}`             : '') +
+      (retailPriceChanged  ? `, retail_price: ${existing.retail_price} → ${newRetailPrice}`    : '') +
+      ')'
     );
 
     res.json({ message: 'Inventory updated successfully' });
   } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
+    await conn.rollback();
+    res.status(err.status || 500).json({ message: err.message });
+  } finally { conn.release(); }
 });
 
 // ─── generateInventoryPDF ─────────────────────────────────────────────────────
