@@ -746,25 +746,28 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
 // (grouped) by that combination. Layer 1 is required; Layers 2-4 are optional
 // ("skip further layers" in the UI just means fewer entries in `layers`).
 //
-// GRAIN NOTE: Salesman and Customer are attributes of the *invoice* (sales
-// row), but Company and Product only exist at the *line-item* level (one
-// invoice can carry products from several companies). So:
-//   - If neither 'company' nor 'product' is requested, we aggregate at
-//     invoice level directly off `sales` (fast, and avoids the row-duplication
-//     risk of joining the un-aggregated `recoveries` table — see fix below).
-//   - If 'company' or 'product' IS requested, we aggregate at sale_item level
-//     and attribute return/discount/recovered amounts to each item via
-//     `return_items` and `recovery_items` (both carry sale_item_id).
+// Single source of truth (post 2026-08 refactor)
+// ----------------------------------------------
+// Every layer combination now aggregates off `sale_items`, using the
+// per-line cumulatives maintained by the recovery flow:
 //
-// ASSUMPTION TO VERIFY (Danish): item-level Return/Discount/Recovered here
-// rely on `return_items` and `recovery_items` rows existing per sale_item.
-// If a fully-paid same-day Quick Recovery settlement does NOT insert
-// recovery_items rows for items with no discount/return, item-level
-// "Recovered" will undercount for those items even though the invoice-level
-// sales.total_recovered is correct. If that's the case, this needs a
-// fallback proration step (recovered * item_gross / invoice_gross) for
-// invoices that have no recovery_items rows at all — flag this and I'll wire
-// it in.
+//   sale_items.total              → gross_amount    (tax-inclusive line total)
+//   sale_items.recovery_discount  → discount        (invariant 4: SUM = sales.total_discount)
+//   sale_items.recovered_amount   → recovered_amount(invariant 5: SUM = sales.total_recovered)
+//   return_items via subquery     → return_amount   (per sale_item, no duplication)
+//
+// This kills the drift that the previous two-branch design had: the
+// invoice-level path (salesman / customer) and the item-level path
+// (company / product) used different sources for Return and Recovered
+// and disagreed by the amount of cross-invoice returns + un-attributed
+// cash. Now every layer produces the same numbers by construction because
+// the underlying per-line columns are what the recovery flow keeps in
+// sync with `sales.total_*` on every write (see recoveries.js invariants).
+//
+// Salesman and Customer live on `sales`, so they're pulled via the
+// mandatory JOIN to sales; Product and Company live on `products`, pulled
+// via sale_items.product_id → products → companies. No conditional SQL
+// paths — one query serves every layer combination.
 
 const SALE_SUMMARY_ENTITIES = {
   salesman: { label: 'Salesman', grain: 'invoice' },
@@ -790,12 +793,11 @@ function parseSaleSummaryLayers(layersParam) {
 }
 
 async function fetchSaleSummaryData({ from_date, to_date, layers }) {
-  const itemLevel = layers.some(l => SALE_SUMMARY_ENTITIES[l].grain === 'item');
-
-  // NOTE: no COALESCE-to-placeholder-text here — unassigned salesmen / products
-  // with no company come through as NULL, and the UI/PDF render that as a plain
-  // "—" like every other blank value in the system, instead of a noisy
-  // "(Unassigned)" label.
+  // Salesman/Customer come off the sales row; Product/Company come off
+  // the sale_items → products join. Both are always available because
+  // the query aggregates at sale_item grain regardless of which layers
+  // were requested. Unassigned salesmen / uncategorized products render
+  // as NULL → the UI/PDF prints "—".
   const labelExprs = {
     salesman: 'e_sm.name',
     customer: 'c.name',
@@ -811,58 +813,31 @@ async function fetchSaleSummaryData({ from_date, to_date, layers }) {
   const orderCols = layers.map((_, i) => `layer${i + 1} IS NULL, layer${i + 1}`).join(', ');
 
   const params = [];
-  let sql;
-
-  if (!itemLevel) {
-    // Invoice-level: aggregate straight off `sales`. Using the sale's own
-    // running totals (total_amount, total_return_amount, total_discount,
-    // total_recovered) instead of joining `recoveries` avoids duplicating
-    // rows for invoices with multiple recovery events.
-    sql = `
-      SELECT
-        ${selectCols},
-        SUM(s.total_amount - s.total_return_amount - s.total_discount) AS net_amount,
-        SUM(s.total_return_amount) AS return_amount,
-        SUM(s.total_discount) AS discount,
-        SUM(s.total_amount) AS gross_amount,
-        SUM(s.total_recovered) AS recovered_amount
-      FROM sales s
-      JOIN customers c ON s.customer_id = c.id
-      LEFT JOIN employees e_sm ON s.salesman_id = e_sm.id
-      WHERE 1=1`;
-    if (from_date) { sql += ' AND s.date >= ?'; params.push(from_date); }
-    if (to_date)   { sql += ' AND s.date <= ?'; params.push(to_date);   }
-    sql += ` GROUP BY ${groupCols} ORDER BY ${orderCols}`;
-  } else {
-    // Item-level: aggregate off sale_items, attributing return/discount/
-    // recovered amounts via return_items / recovery_items (see caveat above).
-    sql = `
-      SELECT
-        ${selectCols},
-        SUM(si.total) AS gross_amount,
-        SUM(COALESCE(ri.ret, 0)) AS return_amount,
-        SUM(COALESCE(rv.disc, 0)) AS discount,
-        SUM(si.total - COALESCE(ri.ret, 0) - COALESCE(rv.disc, 0)) AS net_amount,
-        SUM(COALESCE(rv.rec, 0)) AS recovered_amount
-      FROM sale_items si
-      JOIN sales s ON si.sale_id = s.id
-      JOIN customers c ON s.customer_id = c.id
-      LEFT JOIN employees e_sm ON s.salesman_id = e_sm.id
-      JOIN products p ON si.product_id = p.id
-      LEFT JOIN companies co ON p.company_id = co.id
-      LEFT JOIN (
-        SELECT sale_item_id, SUM(return_amount) AS ret
-        FROM return_items GROUP BY sale_item_id
-      ) ri ON ri.sale_item_id = si.id
-      LEFT JOIN (
-        SELECT sale_item_id, SUM(discount_given) AS disc, SUM(final_amount) AS rec
-        FROM recovery_items GROUP BY sale_item_id
-      ) rv ON rv.sale_item_id = si.id
-      WHERE 1=1`;
-    if (from_date) { sql += ' AND s.date >= ?'; params.push(from_date); }
-    if (to_date)   { sql += ' AND s.date <= ?'; params.push(to_date);   }
-    sql += ` GROUP BY ${groupCols} ORDER BY ${orderCols}`;
-  }
+  let sql = `
+    SELECT
+      ${selectCols},
+      SUM(si.total)                             AS gross_amount,
+      SUM(COALESCE(ri.ret, 0))                  AS return_amount,
+      SUM(si.recovery_discount)                 AS discount,
+      SUM(si.total
+          - COALESCE(ri.ret, 0)
+          - si.recovery_discount)               AS net_amount,
+      SUM(si.recovered_amount)                  AS recovered_amount
+    FROM sale_items si
+    JOIN sales      s    ON si.sale_id     = s.id
+    JOIN customers  c    ON s.customer_id  = c.id
+    LEFT JOIN employees e_sm ON s.salesman_id = e_sm.id
+    JOIN products   p    ON si.product_id  = p.id
+    LEFT JOIN companies co ON p.company_id = co.id
+    LEFT JOIN (
+      SELECT sale_item_id, SUM(return_amount) AS ret
+        FROM return_items
+       GROUP BY sale_item_id
+    ) ri ON ri.sale_item_id = si.id
+    WHERE 1=1`;
+  if (from_date) { sql += ' AND s.date >= ?'; params.push(from_date); }
+  if (to_date)   { sql += ' AND s.date <= ?'; params.push(to_date);   }
+  sql += ` GROUP BY ${groupCols} ORDER BY ${orderCols}`;
 
   const [rows] = await db.query(sql, params);
   return rows;
