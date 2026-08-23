@@ -1179,4 +1179,335 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   doc.end();
 }
 
+
+// ─── Sale & Stock Report ─────────────────────────────────────────────────────
+//
+// Product-level "how much did we have, sell, take back, and end with" report
+// over a date window, with an optional company filter.
+//
+// Columns (all consolidated across batches for a product):
+//   Sr | Product | Pack Size | Opening Stock | Gross Sale (qty) |
+//   Return (qty) | Net Sale (Unit) | Net Sale (Value) | Closing Stock
+//
+// Key rules
+// ---------
+//  1. Batches are NEVER split. One row per product regardless of how many
+//     batches are on hand or moved through the period.
+//  2. `Gross Sale (qty)` is physical units sold in the period, INCLUDING
+//     bonus units — `qty + bonus` per sale_items row where sales.date is
+//     inside [from_date, to_date]. Bonus stock came off the shelves too.
+//  3. `Return (qty)` is physical units returned in the period — filtered by
+//     `recoveries.date`, not `sales.date`. A return may hit an invoice from
+//     any earlier period.
+//  4. `Net Sale (Value)` is the money version of "what customers actually
+//     paid, net of discounts and refunds". It's derived, per invariants
+//     established by the 2026-08 recovery refactor, from:
+//        gross_value    = SUM(sale_items.total)           filtered by sales.date
+//        discount_value = SUM(recovery_items.discount_given) filtered by recoveries.date
+//        return_value   = SUM(return_items.return_amount)    filtered by recoveries.date
+//        net_value      = gross_value − discount_value − return_value
+//     This deliberately does NOT do (net_units × standard_rate) — that
+//     approach silently drops line-level and recovery-time discounts.
+//  5. `Opening Stock` at `from_date` is reconstructed by rolling back
+//     current physical stock through the `inventory_movements` journal:
+//        opening = SUM(inventory.qty) − SUM(qty_in − qty_out
+//                                            WHERE movement_date >= from_date)
+//     The journal has been live since 2026-08-22, so any from_date on or
+//     after that is exact. For earlier from_dates it's an approximation —
+//     pre-refactor movements aren't journaled, so the roll-back skips
+//     them and any pre-refactor buys/sells inside the window silently
+//     land in "opening". That drift is disclosed in the UI note.
+//  6. `Closing Stock` uses the operator's stated formula:
+//        closing = opening − gross_qty + return_qty
+//     Note this deliberately IGNORES purchases inside the window; the
+//     report is a sales-attribution view of stock, not a running physical
+//     balance. If purchases happened in-period, closing here will differ
+//     from real physical stock at to_date — that's intentional per spec.
+//
+// Idle-product filter
+// -------------------
+//   Products with zero opening stock AND zero sales AND zero returns in
+//   the window are excluded so the operator isn't scrolling through a
+//   full product master to find the movers.
+
+async function fetchSaleAndStockReportData({ from_date, to_date, company_id }) {
+  // Widen bounds when a side is omitted so the SQL is single-shape.
+  const winFrom       = from_date || '1900-01-01';
+  const winTo         = to_date   || '9999-12-31';
+  // For the opening-stock roll-back the reference date is exactly
+  // from_date; when omitted, we skip the roll-back (opening = current qty).
+  const openingCutoff = from_date || null;
+
+  const params = [];
+  //   [1] opening cutoff  (used twice: once in CASE, once in subquery filter)
+  params.push(openingCutoff, openingCutoff);
+  //   [3] [4] gross qty
+  params.push(winFrom, winTo);
+  //   [5] [6] return qty
+  params.push(winFrom, winTo);
+  //   [7] [8] gross value
+  params.push(winFrom, winTo);
+  //   [9] [10] discount value
+  params.push(winFrom, winTo);
+  //   [11] [12] return value
+  params.push(winFrom, winTo);
+
+  let sql = `
+    SELECT
+      p.id                                       AS product_id,
+      p.name                                     AS product_name,
+      p.pack_size                                AS pack_size,
+      p.company_id                               AS company_id,
+      co.name                                    AS company_name,
+      (
+        COALESCE(inv.total_qty, 0)
+        - CASE WHEN ? IS NULL THEN 0
+               ELSE COALESCE(im.net_after, 0)
+          END
+      )                                          AS opening_stock,
+      COALESCE(gs.gross_qty,   0)                AS gross_qty,
+      COALESCE(rt.return_qty,  0)                AS return_qty,
+      COALESCE(gv.gross_value, 0)                AS gross_value,
+      COALESCE(dg.discount,    0)                AS discount_value,
+      COALESCE(rv.return_value,0)                AS return_value
+    FROM products p
+    LEFT JOIN companies co ON co.id = p.company_id
+    LEFT JOIN (
+      SELECT product_id, SUM(qty) AS total_qty
+        FROM inventory
+       GROUP BY product_id
+    ) inv ON inv.product_id = p.id
+    LEFT JOIN (
+      SELECT product_id, SUM(qty_in - qty_out) AS net_after
+        FROM inventory_movements
+       WHERE movement_date >= ?
+       GROUP BY product_id
+    ) im ON im.product_id = p.id
+    LEFT JOIN (
+      SELECT si.product_id,
+             SUM(si.qty + si.bonus) AS gross_qty
+        FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id
+       WHERE s.date BETWEEN ? AND ?
+       GROUP BY si.product_id
+    ) gs ON gs.product_id = p.id
+    LEFT JOIN (
+      SELECT ri.product_id,
+             SUM(ri.qty_returned) AS return_qty
+        FROM return_items ri
+        JOIN recoveries  r ON r.id = ri.recovery_id
+       WHERE r.date BETWEEN ? AND ?
+       GROUP BY ri.product_id
+    ) rt ON rt.product_id = p.id
+    LEFT JOIN (
+      SELECT si.product_id,
+             SUM(si.total) AS gross_value
+        FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id
+       WHERE s.date BETWEEN ? AND ?
+       GROUP BY si.product_id
+    ) gv ON gv.product_id = p.id
+    LEFT JOIN (
+      SELECT rci.product_id,
+             SUM(rci.discount_given) AS discount
+        FROM recovery_items rci
+        JOIN recoveries    r ON r.id = rci.recovery_id
+       WHERE r.date BETWEEN ? AND ?
+       GROUP BY rci.product_id
+    ) dg ON dg.product_id = p.id
+    LEFT JOIN (
+      SELECT ri.product_id,
+             SUM(ri.return_amount) AS return_value
+        FROM return_items ri
+        JOIN recoveries  r ON r.id = ri.recovery_id
+       WHERE r.date BETWEEN ? AND ?
+       GROUP BY ri.product_id
+    ) rv ON rv.product_id = p.id
+    WHERE 1 = 1
+  `;
+  if (company_id) { sql += ' AND p.company_id = ?'; params.push(company_id); }
+  sql += `
+    HAVING opening_stock <> 0
+        OR gross_qty > 0
+        OR return_qty > 0
+    ORDER BY p.name ASC
+  `;
+
+  const [rows] = await db.query(sql, params);
+  // Round money to 2 decimals per AGENTS.md convention; qtys are integers.
+  const money2 = (n) => Math.round(parseFloat(n || 0) * 100) / 100;
+  return rows.map(r => {
+    const opening   = parseInt(r.opening_stock, 10) || 0;
+    const gross     = parseInt(r.gross_qty,     10) || 0;
+    const ret       = parseInt(r.return_qty,    10) || 0;
+    const gross_v   = parseFloat(r.gross_value)  || 0;
+    const disc_v    = parseFloat(r.discount_value) || 0;
+    const ret_v     = parseFloat(r.return_value) || 0;
+    return {
+      product_id:     r.product_id,
+      product_name:   r.product_name,
+      pack_size:      r.pack_size || '',
+      company_id:     r.company_id,
+      company_name:   r.company_name || '',
+      opening_stock:  opening,
+      gross_qty:      gross,
+      return_qty:     ret,
+      net_sale_unit:  gross - ret,
+      net_sale_value: money2(gross_v - disc_v - ret_v),
+      closing_stock:  opening - gross + ret,
+    };
+  });
+}
+
+router.get('/sale-stock-report', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, company_id } = req.query;
+    const rows = await fetchSaleAndStockReportData({
+      from_date, to_date,
+      company_id: company_id || null,
+    });
+    res.json({ rows });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.get('/sale-stock-report/pdf', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, company_id } = req.query;
+    const rows = await fetchSaleAndStockReportData({
+      from_date, to_date,
+      company_id: company_id || null,
+    });
+    const [[company]] = await db.query('SELECT * FROM company_settings WHERE id=1');
+    let companyLabel = 'All Companies';
+    if (company_id) {
+      const [c] = await db.query('SELECT name FROM companies WHERE id=?', [company_id]);
+      companyLabel = c[0]?.name || String(company_id);
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="sale-stock-report.pdf"');
+    generateSaleAndStockReportPDF(res, { rows, from_date, to_date, companyLabel, company });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ─── generateSaleAndStockReportPDF ──────────────────────────────────────────
+//
+// Same typography and structure as the other reports (same font/row height,
+// same header + filter box + column-based table + total row). Numeric
+// columns are right-aligned; product name flexes.
+function generateSaleAndStockReportPDF(res, {
+  rows, from_date, to_date, companyLabel, company,
+}) {
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
+  doc.pipe(res);
+
+  const companyName = company?.name || 'Medivance';
+  const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+  const footerOpts  = { left, right, contentWidth, companyName };
+
+  let y = drawReportHeader(doc, {
+    company, title: 'SALE & STOCK REPORT',
+    subtitle: 'Inventory & Revenue Performance',
+    left, right, contentWidth,
+  });
+
+  y = drawFilterBox(doc, {
+    left, contentWidth, y,
+    filters: [
+      `Period: ${from_date || 'Beginning'}  to  ${to_date || 'Present'}`,
+      `Company: ${companyLabel}`,
+    ],
+  });
+
+  const cols = buildPdfColumns(left, contentWidth, [
+    { label: 'Sr',            w: 22 },
+    { label: 'Product',       w: 'flex' },
+    { label: 'Pack Size',     w: 60 },
+    { label: 'Opening',       w: 52, align: 'right' },
+    { label: 'Gross Sale',    w: 58, align: 'right' },
+    { label: 'Return',        w: 46, align: 'right' },
+    { label: 'Net (Unit)',    w: 58, align: 'right' },
+    { label: 'Net (Value)',   w: 72, align: 'right' },
+    { label: 'Closing',       w: 52, align: 'right' },
+  ]);
+
+  const pageBottom = getPdfContentBottom(doc);
+
+  function drawHdr(yy) {
+    doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
+    doc.font('Helvetica-Bold').fontSize(TABLE_HDR_FONT_SIZE).fillColor('#000');
+    cols.forEach(c =>
+      doc.text(c.label, c.x + 2, yy + TABLE_TOP_PAD, { width: c.w - 4, align: c.align, lineBreak: false })
+    );
+    doc.moveTo(left, yy + TABLE_HDR_H).lineTo(right, yy + TABLE_HDR_H).stroke();
+    return yy + TABLE_HDR_H;
+  }
+
+  y = drawHdr(y);
+  const totals = { opening: 0, gross: 0, ret: 0, netU: 0, netV: 0, closing: 0 };
+
+  rows.forEach((row, i) => {
+    totals.opening += row.opening_stock;
+    totals.gross   += row.gross_qty;
+    totals.ret     += row.return_qty;
+    totals.netU    += row.net_sale_unit;
+    totals.netV    += row.net_sale_value;
+    totals.closing += row.closing_stock;
+
+    const srStr    = String(i + 1);
+    const nameStr  = row.product_name || '—';
+    const packStr  = row.pack_size    || '—';
+    const openStr  = String(row.opening_stock);
+    const grossStr = String(row.gross_qty);
+    const retStr   = String(row.return_qty);
+    const netUStr  = String(row.net_sale_unit);
+    const netVStr  = Number(row.net_sale_value).toFixed(2);
+    const closeStr = String(row.closing_stock);
+
+    doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
+    const rowH = measureRowHeight(doc, [
+      { text: srStr,    width: cols[0].w - 4 },
+      { text: nameStr,  width: cols[1].w - 4 },
+      { text: packStr,  width: cols[2].w - 4 },
+      { text: openStr,  width: cols[3].w - 4 },
+      { text: grossStr, width: cols[4].w - 4 },
+      { text: retStr,   width: cols[5].w - 4 },
+      { text: netUStr,  width: cols[6].w - 4 },
+      { text: netVStr,  width: cols[7].w - 4 },
+      { text: closeStr, width: cols[8].w - 4 },
+    ], TABLE_MIN_ROW);
+
+    if (y + rowH > pageBottom) { doc.addPage(); y = doc.page.margins.top; y = drawHdr(y); }
+
+    doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
+    doc.text(srStr,    cols[0].x + 2, y + TABLE_TOP_PAD, { width: cols[0].w - 4, lineBreak: false });
+    doc.text(nameStr,  cols[1].x + 2, y + TABLE_TOP_PAD, { width: cols[1].w - 4 }); // wraps freely
+    doc.text(packStr,  cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
+    doc.text(openStr,  cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4, align: 'right', lineBreak: false });
+    doc.text(grossStr, cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+    doc.text(retStr,   cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+    doc.text(netUStr,  cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+    doc.text(netVStr,  cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+    doc.text(closeStr, cols[8].x + 2, y + TABLE_TOP_PAD, { width: cols[8].w - 4, align: 'right', lineBreak: false });
+    y += rowH;
+  });
+
+  doc.moveTo(left, y).lineTo(right, y).stroke();
+  y += 8;
+  y = ensureSpace(doc, y, 24);
+
+  doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
+  doc.text('TOTAL',                     cols[1].x + 2, y, { width: cols[1].w - 4, lineBreak: false });
+  doc.text(String(totals.opening),      cols[3].x + 2, y, { width: cols[3].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.gross),        cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.ret),          cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.netU),         cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(Number(totals.netV).toFixed(2), cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.closing),      cols[8].x + 2, y, { width: cols[8].w - 4, align: 'right', lineBreak: false });
+
+  stampPdfFootersOnAllPages(doc, footerOpts);
+  doc.flushPages();
+  doc.end();
+}
+
+
 module.exports = router;
