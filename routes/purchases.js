@@ -313,8 +313,19 @@ async function generatePurchaseId(dateValue) {
 
 router.get('/', auth, async (req, res) => {
   try {
+    // DATE_FORMAT gives the client a stable ISO string (matches the Sale
+    // list pattern) so string-comparison-based column sorting works
+    // uniformly regardless of the mysql2 date-mode setting.
+    //
+    // `product_ids` is a comma-separated string of every distinct
+    // product_id on this purchase — used by the Purchase page's Product
+    // filter to include historical purchases even for products that
+    // currently have no active stock.
     const [rows] = await db.query(`
-      SELECT p.*, s.name as supplier_name FROM purchases p
+      SELECT p.*, DATE_FORMAT(p.date, '%Y-%m-%d') AS date,
+             s.name as supplier_name,
+             (SELECT GROUP_CONCAT(DISTINCT pi.product_id) FROM purchase_items pi WHERE pi.purchase_id = p.id) AS product_ids
+      FROM purchases p
       JOIN suppliers s ON p.supplier_id=s.id
       ORDER BY p.date DESC, p.id DESC
     `);
