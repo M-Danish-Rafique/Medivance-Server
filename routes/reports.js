@@ -15,7 +15,7 @@ const {
 } = require('../utils/pdfHelpers');
 const { formatDatePKT } = require('../utils/dateUtils');
 
-// ─── Shared PDF constants ─────────────────────────────────────────────────────
+// â”€â”€â”€ Shared PDF constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // All three reports (Ledger, Sales, Recovery) use identical table typography
 // so rows look consistent across the system.
@@ -26,7 +26,7 @@ const TABLE_HDR_H         = 20;    // fixed header-row height
 const TABLE_MIN_ROW       = 18;    // minimum data-row height
 const TABLE_TOP_PAD       = 4;     // top padding inside every row (y + TOP_PAD when drawing)
 
-// ─── Supplier Ledger ──────────────────────────────────────────────────────────
+// â”€â”€â”€ Supplier Ledger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 router.get('/supplier-ledger', auth, async (req, res) => {
   try {
@@ -56,7 +56,7 @@ router.get('/supplier-ledger', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── Customer Ledger ──────────────────────────────────────────────────────────
+// â”€â”€â”€ Customer Ledger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 router.get('/customer-ledger', auth, async (req, res) => {
   try {
@@ -92,7 +92,7 @@ router.get('/customer-ledger', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── PDF: Supplier Ledger ─────────────────────────────────────────────────────
+// â”€â”€â”€ PDF: Supplier Ledger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 router.get('/supplier-ledger/pdf', auth, async (req, res) => {
   try {
@@ -123,7 +123,7 @@ router.get('/supplier-ledger/pdf', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── PDF: Customer Ledger ─────────────────────────────────────────────────────
+// â”€â”€â”€ PDF: Customer Ledger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 router.get('/customer-ledger/pdf', auth, async (req, res) => {
   try {
@@ -156,7 +156,7 @@ router.get('/customer-ledger/pdf', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── generateLedgerPDF ────────────────────────────────────────────────────────
+// â”€â”€â”€ generateLedgerPDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_date, to_date, company }) {
   const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
@@ -169,7 +169,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
   const pageWidth    = doc.page.width;
   const left = 40, right = pageWidth - 40, contentWidth = right - left;
 
-  // ── Page header ─────────────────────────────────────────────────────────────
+  // â”€â”€ Page header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   doc.fillColor('#000');
   const logoOffset      = drawPdfLogo(doc, left, 38, 42);
   const headerTextX     = left + logoOffset;
@@ -193,7 +193,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
 
   let y = Math.max(headerY, doc.y) + 14;
 
-  // ── Entity details box ───────────────────────────────────────────────────────
+  // â”€â”€ Entity details box â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const boxTop = y;
   doc.font('Helvetica-Bold').fontSize(10).text(entity.name, left + 10, y + 8);
   let ey = doc.y + 4;
@@ -219,7 +219,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
     y = doc.y + 8;
   }
 
-  // ── Column layout ───────────────────────────────────────────────────────────
+  // â”€â”€ Column layout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const descW = contentWidth - 65 - 90 - 70 - 60 - 70;
   const cols = {
     date:    { x: left,                       w: 65  },
@@ -248,15 +248,15 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
   let runningBalance = openingBalance;
   y = drawTableHeader(y);
 
-  // ── Opening balance row ──────────────────────────────────────────────────────
+  // â”€â”€ Opening balance row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   {
     const balStr = `${Math.abs(runningBalance).toFixed(2)} ${runningBalance >= 0 ? 'Dr' : 'Cr'}`;
     doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE).fillColor('#000');
-    doc.text('—',               cols.date.x,    y + TABLE_TOP_PAD, { width: cols.date.w,        lineBreak: false });
-    doc.text('—',               cols.invoice.x, y + TABLE_TOP_PAD, { width: cols.invoice.w,     lineBreak: false });
+    doc.text('â€”',               cols.date.x,    y + TABLE_TOP_PAD, { width: cols.date.w,        lineBreak: false });
+    doc.text('â€”',               cols.invoice.x, y + TABLE_TOP_PAD, { width: cols.invoice.w,     lineBreak: false });
     doc.text('Opening Balance', cols.desc.x,    y + TABLE_TOP_PAD, { width: cols.desc.w,        lineBreak: false });
-    doc.text('—',               cols.dr.x,      y + TABLE_TOP_PAD, { width: cols.dr.w - 4,      align: 'right', lineBreak: false });
-    doc.text('—',               cols.cr.x,      y + TABLE_TOP_PAD, { width: cols.cr.w - 4,      align: 'right', lineBreak: false });
+    doc.text('â€”',               cols.dr.x,      y + TABLE_TOP_PAD, { width: cols.dr.w - 4,      align: 'right', lineBreak: false });
+    doc.text('â€”',               cols.cr.x,      y + TABLE_TOP_PAD, { width: cols.cr.w - 4,      align: 'right', lineBreak: false });
     doc.text(balStr,            cols.balance.x, y + TABLE_TOP_PAD, { width: cols.balance.w - 4, align: 'right', lineBreak: false });
     y += TABLE_MIN_ROW;
   }
@@ -271,10 +271,10 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
     totalCr += cr;
 
     const dateStr    = formatDatePKT(row.date);
-    const invoiceStr = row.invoice_no  || '—';
-    const descStr    = row.description || '—';
-    const drStr      = dr > 0 ? dr.toFixed(2) : '—';
-    const crStr      = cr > 0 ? cr.toFixed(2) : '—';
+    const invoiceStr = row.invoice_no  || 'â€”';
+    const descStr    = row.description || 'â€”';
+    const drStr      = dr > 0 ? dr.toFixed(2) : 'â€”';
+    const crStr      = cr > 0 ? cr.toFixed(2) : 'â€”';
     const balStr     = `${Math.abs(runningBalance).toFixed(2)} ${runningBalance >= 0 ? 'Dr' : 'Cr'}`;
 
     // Set font before measuring so heightOfString uses the exact same metrics
@@ -309,7 +309,7 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
   doc.moveTo(left, y).lineTo(right, y).lineWidth(1).strokeColor('#000').stroke();
   y += 8;
 
-  // ── Totals & closing balance ─────────────────────────────────────────────────
+  // â”€â”€ Totals & closing balance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   y = ensureSpace(doc, y, 70);
   const closingBalStr = `${Math.abs(runningBalance).toFixed(2)} ${runningBalance >= 0 ? 'Dr' : 'Cr'}`;
 
@@ -331,10 +331,10 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
   doc.end();
 }
 
-// ─── Sales report data ────────────────────────────────────────────────────────
+// â”€â”€â”€ Sales report data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function fetchSalesReportData({ from_date, to_date, salesman_id }) {
-  // NOTE: s.total_amount reflects the invoice's NET value — for invoices that had
+  // NOTE: s.total_amount reflects the invoice's NET value â€” for invoices that had
   // a "current invoice" return processed against them (unlocked branch in
   // recoveries.js), total_amount is recalculated down to what's left after that
   // return. So total_amount is the correct NET figure, not the gross sale value.
@@ -365,7 +365,7 @@ async function fetchSalesReportData({ from_date, to_date, salesman_id }) {
   return rows;
 }
 
-// ─── Recovery report data ─────────────────────────────────────────────────────
+// â”€â”€â”€ Recovery report data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function fetchRecoveryReportData({ from_date, to_date, supplier_id }) {
   // NOTE: s.total_amount is the invoice's NET value (see fetchSalesReportData
@@ -450,7 +450,7 @@ async function fetchRecoveryReportData({ from_date, to_date, supplier_id }) {
 }
 
 
-// ─── JSON endpoints ───────────────────────────────────────────────────────────
+// â”€â”€â”€ JSON endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 router.get('/sales-report', auth, async (req, res) => {
   try {
@@ -471,7 +471,7 @@ router.get('/recovery-report', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── PDF endpoints ────────────────────────────────────────────────────────────
+// â”€â”€â”€ PDF endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 router.get('/sales-report/pdf', auth, async (req, res) => {
   try {
@@ -512,7 +512,7 @@ router.get('/recovery-report/pdf', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─── generateSalesReportPDF ───────────────────────────────────────────────────
+// â”€â”€â”€ generateSalesReportPDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, company }) {
   const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
@@ -572,13 +572,13 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
 
     const srStr      = String(i + 1);
     const dateStr    = formatDatePKT(row.date);
-    const invoiceStr = row.invoice_no    || '—';
-    const custStr    = row.customer_name || '—';
+    const invoiceStr = row.invoice_no    || 'â€”';
+    const custStr    = row.customer_name || 'â€”';
     const grossStr   = gross.toFixed(2);
-    const discStr    = disc > 0 ? disc.toFixed(2) : '—';
-    const retStr     = ret  > 0 ? ret.toFixed(2)  : '—';
+    const discStr    = disc > 0 ? disc.toFixed(2) : 'â€”';
+    const retStr     = ret  > 0 ? ret.toFixed(2)  : 'â€”';
     const netStr     = net.toFixed(2);
-    const recStr     = rec  > 0 ? rec.toFixed(2)  : '—';
+    const recStr     = rec  > 0 ? rec.toFixed(2)  : 'â€”';
 
     // Must set font before measuring
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
@@ -586,7 +586,7 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
       { text: srStr,      width: cols[0].w - 4 },
       { text: dateStr,    width: cols[1].w - 4 },
       { text: invoiceStr, width: cols[2].w - 4 },
-      { text: custStr,    width: cols[3].w - 4 },  // flex col – most likely to wrap
+      { text: custStr,    width: cols[3].w - 4 },  // flex col â€“ most likely to wrap
       { text: grossStr,   width: cols[4].w - 4 },
       { text: retStr,     width: cols[5].w - 4 },
       { text: discStr,    width: cols[6].w - 4 },
@@ -626,7 +626,7 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
   doc.end();
 }
 
-// ─── generateRecoveryReportPDF ────────────────────────────────────────────────
+// â”€â”€â”€ generateRecoveryReportPDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabel, company }) {
   const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
@@ -685,11 +685,11 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
 
     const srStr      = String(i + 1);
     const dateStr    = formatDatePKT(row.date);
-    const invoiceStr = row.invoice_no || '—';
-    const custStr    = row.customer_name || '—';
+    const invoiceStr = row.invoice_no || 'â€”';
+    const custStr    = row.customer_name || 'â€”';
     const grossStr   = gross.toFixed(2);
-    const discStr    = disc > 0 ? disc.toFixed(2) : '—';
-    const retStr     = ret  > 0 ? ret.toFixed(2)  : '—';
+    const discStr    = disc > 0 ? disc.toFixed(2) : 'â€”';
+    const retStr     = ret  > 0 ? ret.toFixed(2)  : 'â€”';
     const recStr     = rec.toFixed(2);
     const pendingStr = pending.toFixed(2);
 
@@ -699,7 +699,7 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
       { text: srStr,      width: cols[0].w - 4 },
       { text: dateStr,    width: cols[1].w - 4 },
       { text: invoiceStr, width: cols[2].w - 4 },
-      { text: custStr,    width: cols[3].w - 4 },  // flex col – most likely to wrap
+      { text: custStr,    width: cols[3].w - 4 },  // flex col â€“ most likely to wrap
       { text: grossStr,   width: cols[4].w - 4 },
       { text: discStr,    width: cols[5].w - 4 },
       { text: retStr,     width: cols[6].w - 4 },
@@ -739,10 +739,10 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
   doc.end();
 }
 
-// ─── Sale Summary (multi-level / layered) report ─────────────────────────────
+// â”€â”€â”€ Sale Summary (multi-level / layered) report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
-// Lets the user pick up to 4 "layers" — an ordered, de-duplicated combination
-// of Salesman / Company / Product / Customer — and returns sales aggregated
+// Lets the user pick up to 4 "layers" â€” an ordered, de-duplicated combination
+// of Salesman / Company / Product / Customer â€” and returns sales aggregated
 // (grouped) by that combination. Layer 1 is required; Layers 2-4 are optional
 // ("skip further layers" in the UI just means fewer entries in `layers`).
 //
@@ -751,10 +751,10 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
 // Every layer combination now aggregates off `sale_items`, using the
 // per-line cumulatives maintained by the recovery flow:
 //
-//   sale_items.total              → gross_amount    (tax-inclusive line total)
-//   sale_items.recovery_discount  → discount        (invariant 4: SUM = sales.total_discount)
-//   sale_items.recovered_amount   → recovered_amount(invariant 5: SUM = sales.total_recovered)
-//   return_items via subquery     → return_amount   (per sale_item, no duplication)
+//   sale_items.total              â†’ gross_amount    (tax-inclusive line total)
+//   sale_items.recovery_discount  â†’ discount        (invariant 4: SUM = sales.total_discount)
+//   sale_items.recovered_amount   â†’ recovered_amount(invariant 5: SUM = sales.total_recovered)
+//   return_items via subquery     â†’ return_amount   (per sale_item, no duplication)
 //
 // This kills the drift that the previous two-branch design had: the
 // invoice-level path (salesman / customer) and the item-level path
@@ -766,8 +766,8 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
 //
 // Salesman and Customer live on `sales`, so they're pulled via the
 // mandatory JOIN to sales; Product and Company live on `products`, pulled
-// via sale_items.product_id → products → companies. No conditional SQL
-// paths — one query serves every layer combination.
+// via sale_items.product_id â†’ products â†’ companies. No conditional SQL
+// paths â€” one query serves every layer combination.
 
 const SALE_SUMMARY_ENTITIES = {
   salesman: { label: 'Salesman', grain: 'invoice' },
@@ -794,10 +794,10 @@ function parseSaleSummaryLayers(layersParam) {
 
 async function fetchSaleSummaryData({ from_date, to_date, layers }) {
   // Salesman/Customer come off the sales row; Product/Company come off
-  // the sale_items → products join. Both are always available because
+  // the sale_items â†’ products join. Both are always available because
   // the query aggregates at sale_item grain regardless of which layers
   // were requested. Unassigned salesmen / uncategorized products render
-  // as NULL → the UI/PDF prints "—".
+  // as NULL â†’ the UI/PDF prints "â€”".
   const labelExprs = {
     salesman: 'e_sm.name',
     customer: 'c.name',
@@ -809,7 +809,7 @@ async function fetchSaleSummaryData({ from_date, to_date, layers }) {
   const groupCols  = layers.map((_, i) => `layer${i + 1}`).join(', ');
   // Blank/unassigned values (e.g. no salesman, no company) sort AFTER every
   // real value at that level, instead of MySQL's default of sorting NULL
-  // first — so "—" rows land at the bottom of the report, not the top.
+  // first â€” so "â€”" rows land at the bottom of the report, not the top.
   const orderCols = layers.map((_, i) => `layer${i + 1} IS NULL, layer${i + 1}`).join(', ');
 
   const params = [];
@@ -871,7 +871,7 @@ router.get('/sale-summary/pdf', auth, async (req, res) => {
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 
-// ─── generateSaleSummaryPDF ───────────────────────────────────────────────────
+// â”€â”€â”€ generateSaleSummaryPDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // This report has a different shape than the other three (it's a grouped /
 // hierarchical breakdown, not a flat list), so it gets its own layout logic
@@ -885,7 +885,7 @@ router.get('/sale-summary/pdf', auth, async (req, res) => {
 //    left-most grouping is the primary one.
 //  - Repeated values in an outer layer column are shown once per group
 //    (bold, top-aligned) instead of on every row, with the horizontal rule
-//    for that column suppressed until the group ends — the classic
+//    for that column suppressed until the group ends â€” the classic
 //    "grouped ledger" look. Every column still gets full vertical rules and
 //    the always-changing columns (Sr + the 5 amount columns) still get a
 //    horizontal rule on every row.
@@ -906,7 +906,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     left, right, contentWidth,
   });
 
-  // "Grouped By" sits under the Period line, not as its own header subtitle —
+  // "Grouped By" sits under the Period line, not as its own header subtitle â€”
   // plain comma-separated text (no arrow glyphs: PDFKit's default Helvetica
   // encoding doesn't have them and renders garbage characters instead).
   y = drawFilterBox(doc, {
@@ -917,7 +917,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     ],
   });
 
-  // ── Column layout ────────────────────────────────────────────────────────
+  // â”€â”€ Column layout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Black-and-white-print friendly, whole-number amounts, and layer columns
   // sized by actual content rather than a fixed per-level rule.
   const REDUCTION = 0.85; // amount columns are 85% of their earlier width
@@ -936,7 +936,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   // "Recovered" is the longest header word among the amount columns, so it
   // keeps a slightly larger reservation to stay on one line.
   const RECOVERED_MIN = Math.round(contentWidth * 0.125 * REDUCTION);
-  // Constant base width per layer column — no more "Layer 1 widest" rule.
+  // Constant base width per layer column â€” no more "Layer 1 widest" rule.
   // Layers that actually hold longer text (e.g. Product, Customer names)
   // earn extra width beyond the base; layers with short values (e.g.
   // Salesman) stay close to the base. This is driven by the real data in
@@ -968,7 +968,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   let layerColWidths = contentWeights.map(w => LAYER_BASE_WIDTH + extraPool * (w / weightSum));
   layerColWidths = layerColWidths.map(w => Math.max(LAYER_BASE_WIDTH, Math.round(w)));
 
-  // Recovered gets whatever's left so columns sum to EXACTLY contentWidth —
+  // Recovered gets whatever's left so columns sum to EXACTLY contentWidth â€”
   // this is what makes the "off the page" bug structurally impossible.
   const usedSoFar = srWidth + layerColWidths.reduce((a, b) => a + b, 0) + amtWidth.gross + amtWidth.disc + amtWidth.ret + amtWidth.net;
   amtWidth.rec = contentWidth - usedSoFar;
@@ -990,13 +990,13 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   const layerColStart = 1;               // index of first layer column in `cols`
   const amtColStart = 1 + nLayers;       // index of first amount column in `cols`
   const pageBottom = getPdfContentBottom(doc);
-  // Black only, everywhere — this report gets printed on black-and-white
+  // Black only, everywhere â€” this report gets printed on black-and-white
   // office printers, so anything light gray/tinted risks disappearing.
   // Weight/line-thickness (not color) is what signals hierarchy.
   const LINE_COLOR = '#000000';
 
   function drawVerticalGrid(yTop, yBottom) {
-    // Outer frame — a rule before Sr and after Recovered — is unconditional.
+    // Outer frame â€” a rule before Sr and after Recovered â€” is unconditional.
     // Internal dividers (after Sr, after each layer except the last) only
     // appear once there are 2+ layers, same rule as the web UI.
     doc.strokeColor(LINE_COLOR).lineWidth(0.5);
@@ -1019,7 +1019,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
       doc, cols.map(c => ({ text: c.label, width: c.w - 8 })), TABLE_HDR_H
     );
     // No fill (transparent) and no internal vertical rules between header
-    // labels — just a frame: black rule above/below, plus a vertical edge
+    // labels â€” just a frame: black rule above/below, plus a vertical edge
     // at the very start (before Sr) and very end (after Recovered).
     doc.strokeColor(LINE_COLOR).lineWidth(1);
     doc.moveTo(left, yy).lineTo(right, yy).stroke();
@@ -1033,8 +1033,8 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     return yy + hdrH;
   }
 
-  // ── Precompute, per row & layer, whether this row starts / ends a group ──
-  // (page-break agnostic — purely based on the sorted data itself). Used
+  // â”€â”€ Precompute, per row & layer, whether this row starts / ends a group â”€â”€
+  // (page-break agnostic â€” purely based on the sorted data itself). Used
   // only to merge repeated values into one visual cell; subtotals are a
   // UI-only feature now (kept out of the printed PDF per feedback).
   const rowKey = (row, i) => Array.from({ length: i + 1 }, (_, k) => row[`layer${k + 1}`] || '').join('\u241F');
@@ -1049,7 +1049,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
   const grandTotal = { gross: 0, ret: 0, disc: 0, net: 0, rec: 0 };
   let forcedReopen = new Array(nLayers).fill(false);
 
-  // Whole numbers only — no decimals.
+  // Whole numbers only â€” no decimals.
   const fmtAmt = n => Math.round(n).toString();
   function amountStrs(gross, ret, net, disc, rec) {
     return {
@@ -1095,7 +1095,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     if (y + rowH > pageBottom) {
       // The page is ending here. If a layer's group is still open (its
       // closing rule hasn't been drawn yet because the group hasn't ended
-      // in the data), close it off now at the current page boundary —
+      // in the data), close it off now at the current page boundary â€”
       // otherwise the last row on this page is left without a bottom rule
       // for that column, and it visually "leaks" into whatever prints
       // below it. The group's value simply reprints at the top of the
@@ -1127,7 +1127,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
     doc.text(srStr, cols[0].x + 4, y + TABLE_TOP_PAD, { width: cols[0].w - 8, lineBreak: false });
     layerCells.forEach((s, li) => {
-      if (!s) return; // merged into the group's opening row — leave blank
+      if (!s) return; // merged into the group's opening row â€” leave blank
       // Layer 1 (the primary/outermost grouping) is bolded for visual
       // hierarchy; deeper layers stay regular weight. Bold, not color.
       doc.font(li === 0 ? 'Helvetica-Bold' : 'Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
@@ -1158,7 +1158,7 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
     forcedReopen = new Array(nLayers).fill(false);
   });
 
-  // ── Grand total ───────────────────────────────────────────────────────────
+  // â”€â”€ Grand total â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   if (y + TABLE_MIN_ROW + 10 > pageBottom) { doc.addPage(); y = doc.page.margins.top; y = drawHdr(y); }
   y += 4;
   doc.strokeColor(LINE_COLOR).lineWidth(1.25);
@@ -1180,96 +1180,144 @@ function generateSaleSummaryPDF(res, { rows, from_date, to_date, company, layerL
 }
 
 
-// ─── Sale & Stock Report ─────────────────────────────────────────────────────
+// â”€â”€â”€ Sale & Stock Report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
-// Product-level "how much did we have, sell, take back, and end with" report
-// over a date window, with an optional company filter.
+// Product-level "how much did we have, buy, sell, take back, and end with"
+// report over a date window, with an optional company filter.
 //
 // Columns (all consolidated across batches for a product):
-//   Sr | Product | Pack Size | Opening Stock | Gross Sale (qty) |
-//   Return (qty) | Net Sale (Unit) | Net Sale (Value) | Closing Stock
+//   Sr | Product | Pack Size | Opening | Purchase | Adjustment |
+//   Gross Sale | Return | Net Sale (Unit) | Net Sale (Value) | Closing
+//
+// Balance identity (always holds by construction)
+// -----------------------------------------------
+//   Closing = Opening + Purchase + Adjustment âˆ’ Gross Sale + Return
+//
+//   "Purchase" is a physical INFLOW column â€” units purchased in the period
+//   plus units yielded from manufacturing (mfg_yield_items with
+//   added_to_inventory=1). Both are treated the same by the balance
+//   identity because they add sellable stock to inventory.
+//
+//   "Adjustment" is a SIGNED column carrying the NET manual/adjustment
+//   movement in the period (Add Inventory Manually, Edit Inventory Â±, and
+//   the rare `adjustment` ref_type). Positive = stock added, negative =
+//   stock removed. Split into its own column so the identity holds and
+//   nothing gets silently swept into Opening/Closing.
 //
 // Key rules
 // ---------
-//  1. Batches are NEVER split. One row per product regardless of how many
-//     batches are on hand or moved through the period.
-//  2. `Gross Sale (qty)` is physical units sold in the period, INCLUDING
-//     bonus units — `qty + bonus` per sale_items row where sales.date is
-//     inside [from_date, to_date]. Bonus stock came off the shelves too.
-//  3. `Return (qty)` is physical units returned in the period — filtered by
-//     `recoveries.date`, not `sales.date`. A return may hit an invoice from
-//     any earlier period.
-//  4. `Net Sale (Value)` is the money version of "what customers actually
-//     paid, net of discounts and refunds". It's derived, per invariants
-//     established by the 2026-08 recovery refactor, from:
-//        gross_value    = SUM(sale_items.total)           filtered by sales.date
-//        discount_value = SUM(recovery_items.discount_given) filtered by recoveries.date
-//        return_value   = SUM(return_items.return_amount)    filtered by recoveries.date
-//        net_value      = gross_value − discount_value − return_value
-//     This deliberately does NOT do (net_units × standard_rate) — that
+//  1. Batches are NEVER split. One row per product.
+//  2. `Gross Sale (qty)`   = SUM(sale_items.qty + bonus)  where sales.date âˆˆ window.
+//     Bonus units come off the shelves, so they count.
+//  3. `Return (qty)`       = SUM(return_items.qty_returned) where recoveries.date âˆˆ window.
+//     A return may hit an invoice from any earlier period.
+//  4. `Purchase (qty)`     = SUM(purchase_items.qty + bonus) where purchases.date âˆˆ window
+//                          + SUM(mfg_yield_items.units_manufactured) where mfg_yields.created_at âˆˆ window
+//                            AND mfg_yield_items.added_to_inventory = 1.
+//  5. `Adjustment (qty)`   = SUM(qty_in - qty_out) from inventory_movements
+//                            where movement_date âˆˆ window
+//                            AND ref_type IN ('inventory_manual','adjustment').
+//  6. `Net Sale (Value)`   = SUM(sale_items.total)         [sales.date filter]
+//                          âˆ’ SUM(recovery_items.discount_given) [recoveries.date filter]
+//                          âˆ’ SUM(return_items.return_amount)    [recoveries.date filter]
+//     This deliberately does NOT do (net_units Ã— standard_rate) â€” that
 //     approach silently drops line-level and recovery-time discounts.
-//  5. `Opening Stock` at `from_date` is reconstructed by rolling back
-//     current physical stock through the `inventory_movements` journal:
-//        opening = SUM(inventory.qty) − SUM(qty_in − qty_out
-//                                            WHERE movement_date >= from_date)
-//     The journal has been live since 2026-08-22, so any from_date on or
-//     after that is exact. For earlier from_dates it's an approximation —
-//     pre-refactor movements aren't journaled, so the roll-back skips
-//     them and any pre-refactor buys/sells inside the window silently
-//     land in "opening". That drift is disclosed in the UI note.
-//  6. `Closing Stock` uses the operator's stated formula:
-//        closing = opening − gross_qty + return_qty
-//     Note this deliberately IGNORES purchases inside the window; the
-//     report is a sales-attribution view of stock, not a running physical
-//     balance. If purchases happened in-period, closing here will differ
-//     from real physical stock at to_date — that's intentional per spec.
+//  7. `Opening Stock` at from_date is reconstructed from CURRENT physical
+//     stock by rolling back every activity from from_date onwards, using
+//     SOURCE TABLES (sales, returns, purchases, mfg_yields) â€” not the
+//     inventory_movements journal. This makes the report reliable across
+//     the 2026-08-22 refactor boundary, since source tables carry the
+//     full historical record while the journal only covers post-refactor
+//     movements. Manual `inventory_manual` and `adjustment` corrections
+//     still come from inventory_movements (it's the only source of truth
+//     for those):
+//        opening = current_stock
+//                + sales_since_D             [add back what was sold]
+//                âˆ’ returns_since_D           [subtract returns received]
+//                âˆ’ purchases_since_D         [subtract purchases received]
+//                âˆ’ mfg_since_D               [subtract manufacturing yields]
+//                âˆ’ manual_net_since_D        [subtract net manual movements]
+//  8. `Closing Stock` is derived from the same source aggregates, so the
+//     balance identity above is EXACT â€” no drift between rows and totals.
+//     When to_date = today, Closing exactly matches current physical stock.
+//
+// Required inputs
+// ---------------
+//  Both from_date and to_date are REQUIRED. An unbounded window produces
+//  nonsensical numbers (opening = current physical stock, gross = every
+//  sale ever), which is exactly the shipping bug this rewrite fixes.
 //
 // Idle-product filter
 // -------------------
-//   Products with zero opening stock AND zero sales AND zero returns in
-//   the window are excluded so the operator isn't scrolling through a
-//   full product master to find the movers.
+//  Products with zero opening AND zero activity in the window are hidden
+//  so the operator sees only movers/holders.
+//
+// SQL naming convention (defensive)
+// ---------------------------------
+//  Every derived-table column is given a UNIQUE alias that is NOT reused
+//  as an outer SELECT alias anywhere in the statement. This is deliberate:
+//  if a derived table's column has the same name as an outer SELECT alias,
+//  MySQL's HAVING clause resolution can pick either one (server-version
+//  and sql_mode dependent), which caused a "purchase_qty always 0"
+//  regression. Aliases: `qty_after_*` for roll-back subqueries,
+//  `qty_in_*` for in-period aggregates, `val_*` for values.
 
 async function fetchSaleAndStockReportData({ from_date, to_date, company_id }) {
-  // Widen bounds when a side is omitted so the SQL is single-shape.
-  const winFrom       = from_date || '1900-01-01';
-  const winTo         = to_date   || '9999-12-31';
-  // For the opening-stock roll-back the reference date is exactly
-  // from_date; when omitted, we skip the roll-back (opening = current qty).
-  const openingCutoff = from_date || null;
+  if (!from_date || !to_date) {
+    const err = new Error('from_date and to_date are required');
+    err.status = 400;
+    throw err;
+  }
 
   const params = [];
-  //   [1] opening cutoff  (used twice: once in CASE, once in subquery filter)
-  params.push(openingCutoff, openingCutoff);
-  //   [3] [4] gross qty
-  params.push(winFrom, winTo);
-  //   [5] [6] return qty
-  params.push(winFrom, winTo);
-  //   [7] [8] gross value
-  params.push(winFrom, winTo);
-  //   [9] [10] discount value
-  params.push(winFrom, winTo);
-  //   [11] [12] return value
-  params.push(winFrom, winTo);
+  //   openingCutoff â€” used 5x (sales_since, returns_since, purchases_since,
+  //                            mfg_since, manual_net_since)
+  //   winFrom/winTo â€” used 7x (gross, return, purchase, mfg, manual (in
+  //                            period), gross_value, discount_value,
+  //                            return_value)
+  const openingCutoff = from_date;
+  const winFrom       = from_date;
+  const winTo         = to_date;
+
+  // Roll-back subqueries (one push per subquery param) â€” one placeholder per ?
+  // in the SQL below, in top-to-bottom order.
+  params.push(openingCutoff);                    // sRB   sales_since
+  params.push(openingCutoff);                    // reRB  returns_since
+  params.push(openingCutoff);                    // puRB  purchases_since
+  params.push(openingCutoff);                    // mfRB  mfg_since
+  params.push(openingCutoff);                    // mnRB  manual_since
+  params.push(winFrom, winTo);                   // sIn   gross_qty (in period)
+  params.push(winFrom, winTo);                   // reIn  return_qty (in period)
+  params.push(winFrom, winTo);                   // puIn  purchase_qty (in period)
+  params.push(winFrom, winTo);                   // mfIn  mfg_qty (in period)
+  params.push(winFrom, winTo);                   // mnIn  manual_qty (in period)
+  params.push(winFrom, winTo);                   // gvIn  gross_value
+  params.push(winFrom, winTo);                   // dgIn  discount_value
+  params.push(winFrom, winTo);                   // rvIn  return_value
 
   let sql = `
     SELECT
-      p.id                                       AS product_id,
-      p.name                                     AS product_name,
-      p.pack_size                                AS pack_size,
-      p.company_id                               AS company_id,
-      co.name                                    AS company_name,
+      p.id                                              AS product_id,
+      p.name                                            AS product_name,
+      p.pack_size                                       AS pack_size,
+      p.company_id                                      AS company_id,
+      co.name                                           AS company_name,
       (
-        COALESCE(inv.total_qty, 0)
-        - CASE WHEN ? IS NULL THEN 0
-               ELSE COALESCE(im.net_after, 0)
-          END
-      )                                          AS opening_stock,
-      COALESCE(gs.gross_qty,   0)                AS gross_qty,
-      COALESCE(rt.return_qty,  0)                AS return_qty,
-      COALESCE(gv.gross_value, 0)                AS gross_value,
-      COALESCE(dg.discount,    0)                AS discount_value,
-      COALESCE(rv.return_value,0)                AS return_value
+        COALESCE(inv.total_qty,           0)
+        + COALESCE(sRB.qty_after_sale,    0)
+        - COALESCE(reRB.qty_after_ret,    0)
+        - COALESCE(puRB.qty_after_pur,    0)
+        - COALESCE(mfRB.qty_after_mfg,    0)
+        - COALESCE(mnRB.qty_after_manual, 0)
+      )                                                 AS opening_stock,
+      COALESCE(sIn.qty_in_gross,           0)           AS gross_qty,
+      COALESCE(reIn.qty_in_return,         0)           AS return_qty,
+      (COALESCE(puIn.qty_in_purchase,      0)
+        + COALESCE(mfIn.qty_in_mfg,        0))          AS purchase_qty,
+      COALESCE(mnIn.qty_in_manual,         0)           AS adjustment_qty,
+      COALESCE(gvIn.val_gross,             0)           AS gross_value,
+      COALESCE(dgIn.val_discount,          0)           AS discount_value,
+      COALESCE(rvIn.val_return,            0)           AS return_value
     FROM products p
     LEFT JOIN companies co ON co.id = p.company_id
     LEFT JOIN (
@@ -1277,59 +1325,131 @@ async function fetchSaleAndStockReportData({ from_date, to_date, company_id }) {
         FROM inventory
        GROUP BY product_id
     ) inv ON inv.product_id = p.id
-    LEFT JOIN (
-      SELECT product_id, SUM(qty_in - qty_out) AS net_after
-        FROM inventory_movements
-       WHERE movement_date >= ?
-       GROUP BY product_id
-    ) im ON im.product_id = p.id
+
+    /* -- Roll-back subqueries: everything on or after from_date, per product.
+       Alias suffix "RB" (roll-back). Every projected column has a UNIQUE
+       name that is NOT reused as an outer SELECT alias -- defensive against
+       MySQL HAVING/reference ambiguity that has caused zeroed columns on
+       some deployments. */
+
     LEFT JOIN (
       SELECT si.product_id,
-             SUM(si.qty + si.bonus) AS gross_qty
+             SUM(COALESCE(si.qty, 0) + COALESCE(si.bonus, 0)) AS qty_after_sale
         FROM sale_items si
-        JOIN sales s ON s.id = si.sale_id
-       WHERE s.date BETWEEN ? AND ?
+        JOIN sales sh ON sh.id = si.sale_id
+       WHERE sh.date >= ?
        GROUP BY si.product_id
-    ) gs ON gs.product_id = p.id
+    ) sRB ON sRB.product_id = p.id
     LEFT JOIN (
-      SELECT ri.product_id,
-             SUM(ri.qty_returned) AS return_qty
+      SELECT ri.product_id, SUM(COALESCE(ri.qty_returned, 0)) AS qty_after_ret
         FROM return_items ri
-        JOIN recoveries  r ON r.id = ri.recovery_id
-       WHERE r.date BETWEEN ? AND ?
+        JOIN recoveries  rh ON rh.id = ri.recovery_id
+       WHERE rh.date >= ?
        GROUP BY ri.product_id
-    ) rt ON rt.product_id = p.id
+    ) reRB ON reRB.product_id = p.id
+    LEFT JOIN (
+      SELECT pi.product_id,
+             SUM(COALESCE(pi.qty, 0) + COALESCE(pi.bonus, 0)) AS qty_after_pur
+        FROM purchase_items pi
+        JOIN purchases ph ON ph.id = pi.purchase_id
+       WHERE ph.date >= ?
+       GROUP BY pi.product_id
+    ) puRB ON puRB.product_id = p.id
+    LEFT JOIN (
+      SELECT myi.product_id, SUM(COALESCE(myi.units_manufactured, 0)) AS qty_after_mfg
+        FROM mfg_yield_items myi
+        JOIN mfg_yields      myh ON myh.id = myi.yield_id
+       WHERE DATE(myh.created_at) >= ?
+         AND myi.added_to_inventory = 1
+       GROUP BY myi.product_id
+    ) mfRB ON mfRB.product_id = p.id
+    LEFT JOIN (
+      SELECT im.product_id,
+             SUM(COALESCE(im.qty_in, 0) - COALESCE(im.qty_out, 0)) AS qty_after_manual
+        FROM inventory_movements im
+       WHERE im.movement_date >= ?
+         AND im.ref_type IN ('inventory_manual', 'adjustment')
+       GROUP BY im.product_id
+    ) mnRB ON mnRB.product_id = p.id
+
+    /* -- In-period aggregates, per product. Alias suffix "In". Every
+       projected column uses a UNIQUE name distinct from outer aliases. */
+
     LEFT JOIN (
       SELECT si.product_id,
-             SUM(si.total) AS gross_value
+             SUM(COALESCE(si.qty, 0) + COALESCE(si.bonus, 0)) AS qty_in_gross
         FROM sale_items si
-        JOIN sales s ON s.id = si.sale_id
-       WHERE s.date BETWEEN ? AND ?
+        JOIN sales sh ON sh.id = si.sale_id
+       WHERE sh.date BETWEEN ? AND ?
        GROUP BY si.product_id
-    ) gv ON gv.product_id = p.id
+    ) sIn ON sIn.product_id = p.id
     LEFT JOIN (
-      SELECT rci.product_id,
-             SUM(rci.discount_given) AS discount
+      SELECT ri.product_id, SUM(COALESCE(ri.qty_returned, 0)) AS qty_in_return
+        FROM return_items ri
+        JOIN recoveries  rh ON rh.id = ri.recovery_id
+       WHERE rh.date BETWEEN ? AND ?
+       GROUP BY ri.product_id
+    ) reIn ON reIn.product_id = p.id
+    LEFT JOIN (
+      SELECT pi.product_id,
+             SUM(COALESCE(pi.qty, 0) + COALESCE(pi.bonus, 0)) AS qty_in_purchase
+        FROM purchase_items pi
+        JOIN purchases ph ON ph.id = pi.purchase_id
+       WHERE ph.date BETWEEN ? AND ?
+       GROUP BY pi.product_id
+    ) puIn ON puIn.product_id = p.id
+    LEFT JOIN (
+      SELECT myi.product_id, SUM(COALESCE(myi.units_manufactured, 0)) AS qty_in_mfg
+        FROM mfg_yield_items myi
+        JOIN mfg_yields      myh ON myh.id = myi.yield_id
+       WHERE DATE(myh.created_at) BETWEEN ? AND ?
+         AND myi.added_to_inventory = 1
+       GROUP BY myi.product_id
+    ) mfIn ON mfIn.product_id = p.id
+    LEFT JOIN (
+      SELECT im.product_id,
+             SUM(COALESCE(im.qty_in, 0) - COALESCE(im.qty_out, 0)) AS qty_in_manual
+        FROM inventory_movements im
+       WHERE im.movement_date BETWEEN ? AND ?
+         AND im.ref_type IN ('inventory_manual', 'adjustment')
+       GROUP BY im.product_id
+    ) mnIn ON mnIn.product_id = p.id
+
+    /* -- Value aggregates. Alias prefix "val_". */
+
+    LEFT JOIN (
+      SELECT si.product_id, SUM(COALESCE(si.total, 0)) AS val_gross
+        FROM sale_items si
+        JOIN sales sh ON sh.id = si.sale_id
+       WHERE sh.date BETWEEN ? AND ?
+       GROUP BY si.product_id
+    ) gvIn ON gvIn.product_id = p.id
+    LEFT JOIN (
+      SELECT rci.product_id, SUM(COALESCE(rci.discount_given, 0)) AS val_discount
         FROM recovery_items rci
-        JOIN recoveries    r ON r.id = rci.recovery_id
-       WHERE r.date BETWEEN ? AND ?
+        JOIN recoveries    rh ON rh.id = rci.recovery_id
+       WHERE rh.date BETWEEN ? AND ?
        GROUP BY rci.product_id
-    ) dg ON dg.product_id = p.id
+    ) dgIn ON dgIn.product_id = p.id
     LEFT JOIN (
-      SELECT ri.product_id,
-             SUM(ri.return_amount) AS return_value
+      SELECT ri.product_id, SUM(COALESCE(ri.return_amount, 0)) AS val_return
         FROM return_items ri
-        JOIN recoveries  r ON r.id = ri.recovery_id
-       WHERE r.date BETWEEN ? AND ?
+        JOIN recoveries  rh ON rh.id = ri.recovery_id
+       WHERE rh.date BETWEEN ? AND ?
        GROUP BY ri.product_id
-    ) rv ON rv.product_id = p.id
+    ) rvIn ON rvIn.product_id = p.id
     WHERE 1 = 1
   `;
   if (company_id) { sql += ' AND p.company_id = ?'; params.push(company_id); }
+  // HAVING references outer SELECT aliases only; each alias is unique
+  // across the whole statement so MySQL cannot resolve to a subquery
+  // column by accident.
   sql += `
-    HAVING opening_stock <> 0
-        OR gross_qty > 0
-        OR return_qty > 0
+    HAVING opening_stock  <> 0
+        OR gross_qty       > 0
+        OR return_qty      > 0
+        OR purchase_qty    > 0
+        OR adjustment_qty <> 0
     ORDER BY p.name ASC
   `;
 
@@ -1337,12 +1457,14 @@ async function fetchSaleAndStockReportData({ from_date, to_date, company_id }) {
   // Round money to 2 decimals per AGENTS.md convention; qtys are integers.
   const money2 = (n) => Math.round(parseFloat(n || 0) * 100) / 100;
   return rows.map(r => {
-    const opening   = parseInt(r.opening_stock, 10) || 0;
-    const gross     = parseInt(r.gross_qty,     10) || 0;
-    const ret       = parseInt(r.return_qty,    10) || 0;
-    const gross_v   = parseFloat(r.gross_value)  || 0;
+    const opening   = parseInt(r.opening_stock,  10) || 0;
+    const purchase  = parseInt(r.purchase_qty,   10) || 0;
+    const adjust    = parseInt(r.adjustment_qty, 10) || 0;
+    const gross     = parseInt(r.gross_qty,      10) || 0;
+    const ret       = parseInt(r.return_qty,     10) || 0;
+    const gross_v   = parseFloat(r.gross_value)    || 0;
     const disc_v    = parseFloat(r.discount_value) || 0;
-    const ret_v     = parseFloat(r.return_value) || 0;
+    const ret_v     = parseFloat(r.return_value)   || 0;
     return {
       product_id:     r.product_id,
       product_name:   r.product_name,
@@ -1350,11 +1472,13 @@ async function fetchSaleAndStockReportData({ from_date, to_date, company_id }) {
       company_id:     r.company_id,
       company_name:   r.company_name || '',
       opening_stock:  opening,
+      purchase_qty:   purchase,
+      adjustment_qty: adjust,
       gross_qty:      gross,
       return_qty:     ret,
       net_sale_unit:  gross - ret,
       net_sale_value: money2(gross_v - disc_v - ret_v),
-      closing_stock:  opening - gross + ret,
+      closing_stock:  opening + purchase + adjust - gross + ret,
     };
   });
 }
@@ -1367,7 +1491,9 @@ router.get('/sale-stock-report', auth, async (req, res) => {
       company_id: company_id || null,
     });
     res.json({ rows });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) {
+    res.status(err.status || 500).json({ message: err.message });
+  }
 });
 
 router.get('/sale-stock-report/pdf', auth, async (req, res) => {
@@ -1386,10 +1512,12 @@ router.get('/sale-stock-report/pdf', auth, async (req, res) => {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="sale-stock-report.pdf"');
     generateSaleAndStockReportPDF(res, { rows, from_date, to_date, companyLabel, company });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) {
+    res.status(err.status || 500).json({ message: err.message });
+  }
 });
 
-// ─── generateSaleAndStockReportPDF ──────────────────────────────────────────
+// â”€â”€â”€ generateSaleAndStockReportPDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // Same typography and structure as the other reports (same font/row height,
 // same header + filter box + column-based table + total row). Numeric
@@ -1413,7 +1541,7 @@ function generateSaleAndStockReportPDF(res, {
   y = drawFilterBox(doc, {
     left, contentWidth, y,
     filters: [
-      `Period: ${from_date || 'Beginning'}  to  ${to_date || 'Present'}`,
+      `Period: ${from_date}  to  ${to_date}`,
       `Company: ${companyLabel}`,
     ],
   });
@@ -1421,13 +1549,15 @@ function generateSaleAndStockReportPDF(res, {
   const cols = buildPdfColumns(left, contentWidth, [
     { label: 'Sr',            w: 22 },
     { label: 'Product',       w: 'flex' },
-    { label: 'Pack Size',     w: 60 },
-    { label: 'Opening',       w: 52, align: 'right' },
-    { label: 'Gross Sale',    w: 58, align: 'right' },
-    { label: 'Return',        w: 46, align: 'right' },
-    { label: 'Net (Unit)',    w: 58, align: 'right' },
-    { label: 'Net (Value)',   w: 72, align: 'right' },
-    { label: 'Closing',       w: 52, align: 'right' },
+    { label: 'Pack Size',     w: 54 },
+    { label: 'Opening',       w: 42, align: 'right' },
+    { label: 'Purchase',      w: 46, align: 'right' },
+    { label: 'Adj.',          w: 40, align: 'right' },
+    { label: 'Gross Sale',    w: 50, align: 'right' },
+    { label: 'Return',        w: 40, align: 'right' },
+    { label: 'Net (Unit)',    w: 50, align: 'right' },
+    { label: 'Net (Value)',   w: 62, align: 'right' },
+    { label: 'Closing',       w: 42, align: 'right' },
   ]);
 
   const pageBottom = getPdfContentBottom(doc);
@@ -1443,20 +1573,24 @@ function generateSaleAndStockReportPDF(res, {
   }
 
   y = drawHdr(y);
-  const totals = { opening: 0, gross: 0, ret: 0, netU: 0, netV: 0, closing: 0 };
+  const totals = { opening: 0, purchase: 0, adjust: 0, gross: 0, ret: 0, netU: 0, netV: 0, closing: 0 };
 
   rows.forEach((row, i) => {
-    totals.opening += row.opening_stock;
-    totals.gross   += row.gross_qty;
-    totals.ret     += row.return_qty;
-    totals.netU    += row.net_sale_unit;
-    totals.netV    += row.net_sale_value;
-    totals.closing += row.closing_stock;
+    totals.opening  += row.opening_stock;
+    totals.purchase += row.purchase_qty;
+    totals.adjust   += row.adjustment_qty;
+    totals.gross    += row.gross_qty;
+    totals.ret      += row.return_qty;
+    totals.netU     += row.net_sale_unit;
+    totals.netV     += row.net_sale_value;
+    totals.closing  += row.closing_stock;
 
     const srStr    = String(i + 1);
-    const nameStr  = row.product_name || '—';
-    const packStr  = row.pack_size    || '—';
+    const nameStr  = row.product_name || 'â€”';
+    const packStr  = row.pack_size    || 'â€”';
     const openStr  = String(row.opening_stock);
+    const purStr   = String(row.purchase_qty);
+    const adjStr   = row.adjustment_qty === 0 ? '' : String(row.adjustment_qty);
     const grossStr = String(row.gross_qty);
     const retStr   = String(row.return_qty);
     const netUStr  = String(row.net_sale_unit);
@@ -1465,29 +1599,33 @@ function generateSaleAndStockReportPDF(res, {
 
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
     const rowH = measureRowHeight(doc, [
-      { text: srStr,    width: cols[0].w - 4 },
-      { text: nameStr,  width: cols[1].w - 4 },
-      { text: packStr,  width: cols[2].w - 4 },
-      { text: openStr,  width: cols[3].w - 4 },
-      { text: grossStr, width: cols[4].w - 4 },
-      { text: retStr,   width: cols[5].w - 4 },
-      { text: netUStr,  width: cols[6].w - 4 },
-      { text: netVStr,  width: cols[7].w - 4 },
-      { text: closeStr, width: cols[8].w - 4 },
+      { text: srStr,    width: cols[0].w  - 4 },
+      { text: nameStr,  width: cols[1].w  - 4 },
+      { text: packStr,  width: cols[2].w  - 4 },
+      { text: openStr,  width: cols[3].w  - 4 },
+      { text: purStr,   width: cols[4].w  - 4 },
+      { text: adjStr,   width: cols[5].w  - 4 },
+      { text: grossStr, width: cols[6].w  - 4 },
+      { text: retStr,   width: cols[7].w  - 4 },
+      { text: netUStr,  width: cols[8].w  - 4 },
+      { text: netVStr,  width: cols[9].w  - 4 },
+      { text: closeStr, width: cols[10].w - 4 },
     ], TABLE_MIN_ROW);
 
     if (y + rowH > pageBottom) { doc.addPage(); y = doc.page.margins.top; y = drawHdr(y); }
 
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
-    doc.text(srStr,    cols[0].x + 2, y + TABLE_TOP_PAD, { width: cols[0].w - 4, lineBreak: false });
-    doc.text(nameStr,  cols[1].x + 2, y + TABLE_TOP_PAD, { width: cols[1].w - 4 }); // wraps freely
-    doc.text(packStr,  cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
-    doc.text(openStr,  cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4, align: 'right', lineBreak: false });
-    doc.text(grossStr, cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
-    doc.text(retStr,   cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-    doc.text(netUStr,  cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
-    doc.text(netVStr,  cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
-    doc.text(closeStr, cols[8].x + 2, y + TABLE_TOP_PAD, { width: cols[8].w - 4, align: 'right', lineBreak: false });
+    doc.text(srStr,    cols[0].x  + 2, y + TABLE_TOP_PAD, { width: cols[0].w  - 4, lineBreak: false });
+    doc.text(nameStr,  cols[1].x  + 2, y + TABLE_TOP_PAD, { width: cols[1].w  - 4 }); // wraps freely
+    doc.text(packStr,  cols[2].x  + 2, y + TABLE_TOP_PAD, { width: cols[2].w  - 4, lineBreak: false });
+    doc.text(openStr,  cols[3].x  + 2, y + TABLE_TOP_PAD, { width: cols[3].w  - 4, align: 'right', lineBreak: false });
+    doc.text(purStr,   cols[4].x  + 2, y + TABLE_TOP_PAD, { width: cols[4].w  - 4, align: 'right', lineBreak: false });
+    doc.text(adjStr,   cols[5].x  + 2, y + TABLE_TOP_PAD, { width: cols[5].w  - 4, align: 'right', lineBreak: false });
+    doc.text(grossStr, cols[6].x  + 2, y + TABLE_TOP_PAD, { width: cols[6].w  - 4, align: 'right', lineBreak: false });
+    doc.text(retStr,   cols[7].x  + 2, y + TABLE_TOP_PAD, { width: cols[7].w  - 4, align: 'right', lineBreak: false });
+    doc.text(netUStr,  cols[8].x  + 2, y + TABLE_TOP_PAD, { width: cols[8].w  - 4, align: 'right', lineBreak: false });
+    doc.text(netVStr,  cols[9].x  + 2, y + TABLE_TOP_PAD, { width: cols[9].w  - 4, align: 'right', lineBreak: false });
+    doc.text(closeStr, cols[10].x + 2, y + TABLE_TOP_PAD, { width: cols[10].w - 4, align: 'right', lineBreak: false });
     y += rowH;
   });
 
@@ -1496,13 +1634,16 @@ function generateSaleAndStockReportPDF(res, {
   y = ensureSpace(doc, y, 24);
 
   doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
-  doc.text('TOTAL',                     cols[1].x + 2, y, { width: cols[1].w - 4, lineBreak: false });
-  doc.text(String(totals.opening),      cols[3].x + 2, y, { width: cols[3].w - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.gross),        cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.ret),          cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.netU),         cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
-  doc.text(Number(totals.netV).toFixed(2), cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.closing),      cols[8].x + 2, y, { width: cols[8].w - 4, align: 'right', lineBreak: false });
+  doc.text('TOTAL',                        cols[1].x  + 2, y, { width: cols[1].w  - 4, lineBreak: false });
+  doc.text(String(totals.opening),         cols[3].x  + 2, y, { width: cols[3].w  - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.purchase),        cols[4].x  + 2, y, { width: cols[4].w  - 4, align: 'right', lineBreak: false });
+  doc.text(totals.adjust === 0 ? '' : String(totals.adjust),
+                                           cols[5].x  + 2, y, { width: cols[5].w  - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.gross),           cols[6].x  + 2, y, { width: cols[6].w  - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.ret),             cols[7].x  + 2, y, { width: cols[7].w  - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.netU),            cols[8].x  + 2, y, { width: cols[8].w  - 4, align: 'right', lineBreak: false });
+  doc.text(Number(totals.netV).toFixed(2), cols[9].x  + 2, y, { width: cols[9].w  - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.closing),         cols[10].x + 2, y, { width: cols[10].w - 4, align: 'right', lineBreak: false });
 
   stampPdfFootersOnAllPages(doc, footerOpts);
   doc.flushPages();
