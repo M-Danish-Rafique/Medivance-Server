@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`audit_logs` (
   INDEX `idx_al_module` (`module` ASC) VISIBLE,
   INDEX `idx_al_created` (`created_at` ASC) VISIBLE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 2381
+AUTO_INCREMENT = 2867
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`customer_ledger` (
     FOREIGN KEY (`customer_id`)
     REFERENCES `medivance`.`customers` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 1263
+AUTO_INCREMENT = 1387
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`customers` (
     REFERENCES `medivance`.`territories` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 352
+AUTO_INCREMENT = 369
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -245,6 +245,33 @@ CREATE TABLE IF NOT EXISTS `medivance`.`inventory` (
     ON DELETE CASCADE)
 ENGINE = InnoDB
 AUTO_INCREMENT = 137
+DEFAULT CHARACTER SET = utf8mb4
+COLLATE = utf8mb4_0900_ai_ci;
+
+-- ----------------------------------------------------------------------------
+-- Table medivance.inventory_movements
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `medivance`.`inventory_movements` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `product_id` INT NOT NULL,
+  `batch_no` VARCHAR(100) NOT NULL,
+  `movement_date` DATE NOT NULL,
+  `ref_type` ENUM('purchase', 'sale', 'return', 'inventory_manual', 'manufacturing', 'adjustment') NOT NULL,
+  `ref_id` INT NULL DEFAULT NULL,
+  `qty_in` INT NOT NULL DEFAULT '0',
+  `qty_out` INT NOT NULL DEFAULT '0',
+  `rate_at_movement` DECIMAL(12,4) NULL DEFAULT NULL,
+  `note` VARCHAR(300) NULL DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  INDEX `idx_im_product_batch_date` (`product_id` ASC, `batch_no` ASC, `movement_date` ASC) VISIBLE,
+  INDEX `idx_im_ref` (`ref_type` ASC, `ref_id` ASC) VISIBLE,
+  CONSTRAINT `fk_im_product`
+    FOREIGN KEY (`product_id`)
+    REFERENCES `medivance`.`products` (`id`)
+    ON DELETE CASCADE)
+ENGINE = InnoDB
+AUTO_INCREMENT = 2366
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -390,29 +417,6 @@ DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
 -- ----------------------------------------------------------------------------
--- Table medivance.print_queue
--- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS `medivance`.`print_queue` (
-  `id` INT NOT NULL AUTO_INCREMENT,
-  `sale_id` INT NOT NULL,
-  `invoice_no` VARCHAR(30) NOT NULL,
-  `pdf_name` VARCHAR(255) NOT NULL,
-  `invoice_type` ENUM('warranty', 'warranty10', 'non-warranty') NOT NULL DEFAULT 'warranty',
-  `is_selected` TINYINT(1) NOT NULL DEFAULT '1',
-  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (`id`),
-  UNIQUE INDEX `uq_pq_sale` (`sale_id` ASC) VISIBLE,
-  CONSTRAINT `fk_pq_sale`
-    FOREIGN KEY (`sale_id`)
-    REFERENCES `medivance`.`sales` (`id`)
-    ON DELETE CASCADE)
-ENGINE = InnoDB
-AUTO_INCREMENT = 71
-DEFAULT CHARACTER SET = utf8mb4
-COLLATE = utf8mb4_0900_ai_ci;
-
--- ----------------------------------------------------------------------------
 -- Table medivance.product_categories
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS `medivance`.`product_categories` (
@@ -422,6 +426,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`product_categories` (
   PRIMARY KEY (`id`),
   UNIQUE INDEX `uq_cat_name` (`name` ASC) VISIBLE)
 ENGINE = InnoDB
+AUTO_INCREMENT = 3
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -578,7 +583,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`recoveries` (
     REFERENCES `medivance`.`employees` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 601
+AUTO_INCREMENT = 660
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -609,7 +614,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`recovery_items` (
     FOREIGN KEY (`sale_item_id`)
     REFERENCES `medivance`.`sale_items` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 28
+AUTO_INCREMENT = 36
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -626,7 +631,6 @@ CREATE TABLE IF NOT EXISTS `medivance`.`return_items` (
   `qty_returned` INT NULL DEFAULT '0',
   `return_rate` DECIMAL(12,2) NULL DEFAULT '0.00',
   `return_amount` DECIMAL(12,2) NULL DEFAULT '0.00',
-  `settlement_branch` ENUM('shrink', 'credit', 'source_pending') NOT NULL DEFAULT 'credit',
   PRIMARY KEY (`id`),
   INDEX `fk_ret_recovery` (`recovery_id` ASC) VISIBLE,
   INDEX `fk_ret_sale` (`sale_id` ASC) VISIBLE,
@@ -646,7 +650,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`return_items` (
     FOREIGN KEY (`sale_item_id`)
     REFERENCES `medivance`.`sale_items` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 191
+AUTO_INCREMENT = 208
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -711,12 +715,15 @@ CREATE TABLE IF NOT EXISTS `medivance`.`sale_items` (
   `batch_no` VARCHAR(100) NULL DEFAULT NULL,
   `pack_size` VARCHAR(100) NULL DEFAULT NULL,
   `sale_rate` DECIMAL(12,2) NULL DEFAULT '0.00',
+  `purchase_rate_snapshot` DECIMAL(12,4) NULL DEFAULT NULL,
   `qty` INT NULL DEFAULT '0',
   `bonus` INT NULL DEFAULT '0',
   `discount_pct` DECIMAL(5,2) NULL DEFAULT '0.00',
   `tax_pct` DECIMAL(5,2) NULL DEFAULT '0.00',
-  `sale_tax_pct` DECIMAL(5,2) NULL DEFAULT '0.00',
   `total` DECIMAL(12,2) NULL DEFAULT '0.00',
+  `returned_qty` INT NOT NULL DEFAULT '0',
+  `recovery_discount` DECIMAL(12,2) NOT NULL DEFAULT '0.00',
+  `recovered_amount` DECIMAL(12,2) NOT NULL DEFAULT '0.00',
   PRIMARY KEY (`id`),
   INDEX `fk_si_sale` (`sale_id` ASC) VISIBLE,
   INDEX `fk_si_product` (`product_id` ASC) VISIBLE,
@@ -728,7 +735,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`sale_items` (
     REFERENCES `medivance`.`sales` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 1361
+AUTO_INCREMENT = 1462
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -750,12 +757,16 @@ CREATE TABLE IF NOT EXISTS `medivance`.`sales` (
   `total_recovered` DECIMAL(12,2) NOT NULL DEFAULT '0.00',
   `pending_amount` DECIMAL(12,2) NOT NULL DEFAULT '0.00',
   `recovery_status` ENUM('pending', 'completed') NOT NULL DEFAULT 'pending',
+  `printed_at` DATETIME NULL DEFAULT NULL,
+  `last_printed_type` ENUM('warranty', 'warranty10', 'non-warranty') NULL DEFAULT NULL,
+  `last_printed_by` INT NULL DEFAULT NULL,
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   UNIQUE INDEX `uq_invoice_no` (`invoice_no` ASC) VISIBLE,
   INDEX `fk_sale_customer` (`customer_id` ASC) VISIBLE,
   INDEX `fk_sale_salesman` (`salesman_id` ASC) VISIBLE,
   INDEX `fk_sale_delivery` (`delivery_by` ASC) VISIBLE,
+  INDEX `idx_sales_printed_at` (`printed_at` ASC) VISIBLE,
   CONSTRAINT `fk_sale_customer`
     FOREIGN KEY (`customer_id`)
     REFERENCES `medivance`.`customers` (`id`),
@@ -768,7 +779,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`sales` (
     REFERENCES `medivance`.`employees` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 637
+AUTO_INCREMENT = 685
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -905,7 +916,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`territories` (
     REFERENCES `medivance`.`areas` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 116
+AUTO_INCREMENT = 117
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -922,6 +933,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`units_of_measurement` (
   PRIMARY KEY (`id`),
   UNIQUE INDEX `uq_uom_name` (`name` ASC) VISIBLE)
 ENGINE = InnoDB
+AUTO_INCREMENT = 4
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
