@@ -1498,7 +1498,7 @@ router.get('/sale-stock-report', auth, async (req, res) => {
 
 router.get('/sale-stock-report/pdf', auth, async (req, res) => {
   try {
-    const { from_date, to_date, company_id } = req.query;
+    const { from_date, to_date, company_id, stock_mode } = req.query;
     const rows = await fetchSaleAndStockReportData({
       from_date, to_date,
       company_id: company_id || null,
@@ -1509,9 +1509,12 @@ router.get('/sale-stock-report/pdf', auth, async (req, res) => {
       const [c] = await db.query('SELECT name FROM companies WHERE id=?', [company_id]);
       companyLabel = c[0]?.name || String(company_id);
     }
+    // Whitelist the mode; anything else falls back to 'split' (the pre-toggle
+    // behaviour so old bookmarks keep working).
+    const mode = ['none', 'split', 'combined'].includes(stock_mode) ? stock_mode : 'split';
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="sale-stock-report.pdf"');
-    generateSaleAndStockReportPDF(res, { rows, from_date, to_date, companyLabel, company });
+    generateSaleAndStockReportPDF(res, { rows, from_date, to_date, companyLabel, company, mode });
   } catch (err) {
     res.status(err.status || 500).json({ message: err.message });
   }
@@ -1522,8 +1525,17 @@ router.get('/sale-stock-report/pdf', auth, async (req, res) => {
 // Same typography and structure as the other reports (same font/row height,
 // same header + filter box + column-based table + total row). Numeric
 // columns are right-aligned; product name flexes.
+//
+// `mode` (from the UI Split/Combined/None toggle) drives which inflow
+// columns are drawn:
+//   'none'     â†’ neither Pur nor Adj (compact "sales-only" view)
+//   'split'    â†’ separate Pur and Adj columns
+//   'combined' â†’ single "Pur+Adj" column (their signed sum)
+//
+// Column labels are deliberately terse (Pack, Pur, Adj, Gross, Net) so
+// numeric widths dominate the layout rather than headers wrapping.
 function generateSaleAndStockReportPDF(res, {
-  rows, from_date, to_date, companyLabel, company,
+  rows, from_date, to_date, companyLabel, company, mode = 'none',
 }) {
   const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
   doc.pipe(res);
@@ -1546,19 +1558,33 @@ function generateSaleAndStockReportPDF(res, {
     ],
   });
 
-  const cols = buildPdfColumns(left, contentWidth, [
-    { label: 'Sr',            w: 22 },
-    { label: 'Product',       w: 'flex' },
-    { label: 'Pack Size',     w: 54 },
-    { label: 'Opening',       w: 42, align: 'right' },
-    { label: 'Purchase',      w: 46, align: 'right' },
-    { label: 'Adj.',          w: 40, align: 'right' },
-    { label: 'Gross Sale',    w: 50, align: 'right' },
-    { label: 'Return',        w: 40, align: 'right' },
-    { label: 'Net (Unit)',    w: 50, align: 'right' },
-    { label: 'Net (Value)',   w: 62, align: 'right' },
-    { label: 'Closing',       w: 42, align: 'right' },
-  ]);
+  // Column definitions â€” keyed so we can conditionally insert/remove
+  // in-flow columns without index math drifting.
+  const inflowDefs =
+    mode === 'split'    ? [
+      { key: 'pur',    label: 'Pur.',      w: 30, align: 'right' },
+      { key: 'adj',    label: 'Adj.',      w: 30, align: 'right' },
+    ]
+    : mode === 'combined' ? [
+      { key: 'inflow', label: 'Pur./Adj.',  w: 44, align: 'right' },
+    ]
+    : [];
+
+  const colDefs = [
+    { key: 'sr',    label: 'Sr',          w: 22 },
+    { key: 'name',  label: 'Product',     w: 'flex' },
+    { key: 'pack',  label: 'Pack',        w: 32 },
+    { key: 'open',  label: 'Opening',     w: 40, align: 'right' },
+    ...inflowDefs,
+    { key: 'gross', label: 'Gross',       w: 38, align: 'right' },
+    { key: 'ret',   label: 'Return',      w: 36, align: 'right' },
+    { key: 'netu',  label: 'Net',         w: 30, align: 'right' },
+    { key: 'netv',  label: 'Net (Value)', w: 64, align: 'right' },
+    { key: 'close', label: 'Closing',     w: 42, align: 'right' },
+  ];
+
+  const cols   = buildPdfColumns(left, contentWidth, colDefs);
+  const colBy  = Object.fromEntries(colDefs.map((d, i) => [d.key, cols[i]]));
 
   const pageBottom = getPdfContentBottom(doc);
 
@@ -1575,6 +1601,11 @@ function generateSaleAndStockReportPDF(res, {
   y = drawHdr(y);
   const totals = { opening: 0, purchase: 0, adjust: 0, gross: 0, ret: 0, netU: 0, netV: 0, closing: 0 };
 
+  // Format a signed integer, blank when zero â€” matches on-screen "â€”"
+  // convention but keeps PDF cells clean (no em-dash noise).
+  const fmtQty  = (n) => (n === 0 ? '' : String(n));
+  const fmtSign = (n) => (n === 0 ? '' : (n > 0 ? String(n) : String(n))); // signed already
+
   rows.forEach((row, i) => {
     totals.opening  += row.opening_stock;
     totals.purchase += row.purchase_qty;
@@ -1585,47 +1616,37 @@ function generateSaleAndStockReportPDF(res, {
     totals.netV     += row.net_sale_value;
     totals.closing  += row.closing_stock;
 
-    const srStr    = String(i + 1);
-    const nameStr  = row.product_name || 'â€”';
-    const packStr  = row.pack_size    || 'â€”';
-    const openStr  = String(row.opening_stock);
-    const purStr   = String(row.purchase_qty);
-    const adjStr   = row.adjustment_qty === 0 ? '' : String(row.adjustment_qty);
-    const grossStr = String(row.gross_qty);
-    const retStr   = String(row.return_qty);
-    const netUStr  = String(row.net_sale_unit);
-    const netVStr  = Number(row.net_sale_value).toFixed(2);
-    const closeStr = String(row.closing_stock);
+    const inflowSum = (row.purchase_qty || 0) + (row.adjustment_qty || 0);
+    const cellText = {
+      sr:     String(i + 1),
+      name:   row.product_name || '',
+      pack:   row.pack_size    || '',
+      open:   String(row.opening_stock),
+      pur:    fmtQty(row.purchase_qty),
+      adj:    fmtSign(row.adjustment_qty),
+      inflow: fmtSign(inflowSum),
+      gross:  fmtQty(row.gross_qty),
+      ret:    fmtQty(row.return_qty),
+      netu:   String(row.net_sale_unit),
+      netv:   Number(row.net_sale_value).toFixed(2),
+      close:  String(row.closing_stock),
+    };
 
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
-    const rowH = measureRowHeight(doc, [
-      { text: srStr,    width: cols[0].w  - 4 },
-      { text: nameStr,  width: cols[1].w  - 4 },
-      { text: packStr,  width: cols[2].w  - 4 },
-      { text: openStr,  width: cols[3].w  - 4 },
-      { text: purStr,   width: cols[4].w  - 4 },
-      { text: adjStr,   width: cols[5].w  - 4 },
-      { text: grossStr, width: cols[6].w  - 4 },
-      { text: retStr,   width: cols[7].w  - 4 },
-      { text: netUStr,  width: cols[8].w  - 4 },
-      { text: netVStr,  width: cols[9].w  - 4 },
-      { text: closeStr, width: cols[10].w - 4 },
-    ], TABLE_MIN_ROW);
+    const rowH = measureRowHeight(doc,
+      colDefs.map(d => ({ text: cellText[d.key], width: colBy[d.key].w - 4 })),
+      TABLE_MIN_ROW,
+    );
 
     if (y + rowH > pageBottom) { doc.addPage(); y = doc.page.margins.top; y = drawHdr(y); }
 
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
-    doc.text(srStr,    cols[0].x  + 2, y + TABLE_TOP_PAD, { width: cols[0].w  - 4, lineBreak: false });
-    doc.text(nameStr,  cols[1].x  + 2, y + TABLE_TOP_PAD, { width: cols[1].w  - 4 }); // wraps freely
-    doc.text(packStr,  cols[2].x  + 2, y + TABLE_TOP_PAD, { width: cols[2].w  - 4, lineBreak: false });
-    doc.text(openStr,  cols[3].x  + 2, y + TABLE_TOP_PAD, { width: cols[3].w  - 4, align: 'right', lineBreak: false });
-    doc.text(purStr,   cols[4].x  + 2, y + TABLE_TOP_PAD, { width: cols[4].w  - 4, align: 'right', lineBreak: false });
-    doc.text(adjStr,   cols[5].x  + 2, y + TABLE_TOP_PAD, { width: cols[5].w  - 4, align: 'right', lineBreak: false });
-    doc.text(grossStr, cols[6].x  + 2, y + TABLE_TOP_PAD, { width: cols[6].w  - 4, align: 'right', lineBreak: false });
-    doc.text(retStr,   cols[7].x  + 2, y + TABLE_TOP_PAD, { width: cols[7].w  - 4, align: 'right', lineBreak: false });
-    doc.text(netUStr,  cols[8].x  + 2, y + TABLE_TOP_PAD, { width: cols[8].w  - 4, align: 'right', lineBreak: false });
-    doc.text(netVStr,  cols[9].x  + 2, y + TABLE_TOP_PAD, { width: cols[9].w  - 4, align: 'right', lineBreak: false });
-    doc.text(closeStr, cols[10].x + 2, y + TABLE_TOP_PAD, { width: cols[10].w - 4, align: 'right', lineBreak: false });
+    colDefs.forEach(d => {
+      const c = colBy[d.key];
+      const opts = { width: c.w - 4, lineBreak: d.key === 'name' ? undefined : false };
+      if (d.align) opts.align = d.align;
+      doc.text(cellText[d.key], c.x + 2, y + TABLE_TOP_PAD, opts);
+    });
     y += rowH;
   });
 
@@ -1633,17 +1654,26 @@ function generateSaleAndStockReportPDF(res, {
   y += 8;
   y = ensureSpace(doc, y, 24);
 
+  // TOTAL row â€” label spans Product cell; numerics sit under their columns.
+  const totalCells = {
+    open:   String(totals.opening),
+    pur:    fmtQty(totals.purchase),
+    adj:    fmtSign(totals.adjust),
+    inflow: fmtSign(totals.purchase + totals.adjust),
+    gross:  String(totals.gross),
+    ret:    String(totals.ret),
+    netu:   String(totals.netU),
+    netv:   Number(totals.netV).toFixed(2),
+    close:  String(totals.closing),
+  };
+
   doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
-  doc.text('TOTAL',                        cols[1].x  + 2, y, { width: cols[1].w  - 4, lineBreak: false });
-  doc.text(String(totals.opening),         cols[3].x  + 2, y, { width: cols[3].w  - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.purchase),        cols[4].x  + 2, y, { width: cols[4].w  - 4, align: 'right', lineBreak: false });
-  doc.text(totals.adjust === 0 ? '' : String(totals.adjust),
-                                           cols[5].x  + 2, y, { width: cols[5].w  - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.gross),           cols[6].x  + 2, y, { width: cols[6].w  - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.ret),             cols[7].x  + 2, y, { width: cols[7].w  - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.netU),            cols[8].x  + 2, y, { width: cols[8].w  - 4, align: 'right', lineBreak: false });
-  doc.text(Number(totals.netV).toFixed(2), cols[9].x  + 2, y, { width: cols[9].w  - 4, align: 'right', lineBreak: false });
-  doc.text(String(totals.closing),         cols[10].x + 2, y, { width: cols[10].w - 4, align: 'right', lineBreak: false });
+  doc.text('TOTAL', colBy.name.x + 2, y, { width: colBy.name.w - 4, lineBreak: false });
+  Object.keys(totalCells).forEach(key => {
+    const c = colBy[key];
+    if (!c) return; // column not present in this mode (pur/adj/inflow)
+    doc.text(totalCells[key], c.x + 2, y, { width: c.w - 4, align: 'right', lineBreak: false });
+  });
 
   stampPdfFootersOnAllPages(doc, footerOpts);
   doc.flushPages();
