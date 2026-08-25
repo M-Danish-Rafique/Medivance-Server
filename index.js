@@ -64,8 +64,50 @@ app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {
              COALESCE(SUM(qty * sale_rate),     0) AS estimated_retail_value
         FROM inventory
     `);
-    const [recent_sales] = await db.query(`SELECT s.invoice_no, s.date, s.total_amount, c.name as customer_name FROM sales s JOIN customers c ON s.customer_id=c.id ORDER BY s.date DESC LIMIT 5`);
-    const [top_products] = await db.query(`SELECT p.name, SUM(si.qty) as total_qty FROM sale_items si JOIN products p ON si.product_id=p.id GROUP BY p.id, p.name ORDER BY total_qty DESC LIMIT 5`);
+    // Top 5 products by units sold. Gross profit contribution uses the
+    // frozen cost basis on each line (`purchase_rate_snapshot`) so the
+    // number matches the Profit report exactly, even when inventory rates
+    // have drifted since the sale.
+    const [top_products] = await db.query(`
+      SELECT p.name,
+             SUM(si.qty) AS total_qty,
+             SUM(si.qty * (si.sale_rate - si.purchase_rate_snapshot)) AS gross_profit
+        FROM sale_items si
+        JOIN products p ON si.product_id = p.id
+       GROUP BY p.id, p.name
+       ORDER BY total_qty DESC
+       LIMIT 5
+    `);
+    // Rolling 12-month sales / purchases trajectory for the dual-axis chart.
+    // Both series are aggregated separately then merged onto a month spine
+    // in JS so gaps render as 0 instead of leaving holes in the timeline.
+    const [salesByMonth] = await db.query(`
+      SELECT DATE_FORMAT(date, '%Y-%m') AS month,
+             COALESCE(SUM(total_amount), 0) AS amount
+        FROM sales
+       WHERE date >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 11 MONTH)
+       GROUP BY month
+    `);
+    const [purchasesByMonth] = await db.query(`
+      SELECT DATE_FORMAT(date, '%Y-%m') AS month,
+             COALESCE(SUM(total_amount), 0) AS amount
+        FROM purchases
+       WHERE date >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 11 MONTH)
+       GROUP BY month
+    `);
+    const salesMap    = new Map(salesByMonth.map(r    => [r.month, parseFloat(r.amount)]));
+    const purchaseMap = new Map(purchasesByMonth.map(r => [r.month, parseFloat(r.amount)]));
+    const trajectory = [];
+    const now = new Date();
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      trajectory.push({
+        month:     key,
+        sales:     salesMap.get(key)    || 0,
+        purchases: purchaseMap.get(key) || 0,
+      });
+    }
 
     res.json({
       monthly_sales: parseFloat(monthly_sales),
@@ -79,8 +121,8 @@ app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {
       inventory_asset_value:  parseFloat(inv_totals.inventory_asset_value),
       estimated_retail_value: parseFloat(inv_totals.estimated_retail_value),
       estimated_gross_profit: parseFloat(inv_totals.estimated_retail_value) - parseFloat(inv_totals.inventory_asset_value),
-      recent_sales,
-      top_products
+      top_products,
+      trajectory,
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
