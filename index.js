@@ -56,6 +56,14 @@ app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {
     const [[{ total_payable }]] = await db.query("SELECT COALESCE(SUM(balance),0) as total_payable FROM suppliers WHERE balance > 0");
     const [low_stock] = await db.query('SELECT COUNT(*) as cnt FROM inventory WHERE qty <= low_stock_threshold AND qty > 0');
     const [[{ pending_tax }]] = await db.query('SELECT COALESCE(SUM(tax_amount),0) as pending_tax FROM tax_ledger WHERE submitted_to_fbr=0');
+    // Inventory position — stock valued at cost (asset) and at sale rate
+    // (estimated retail). Gross profit derived client-side to avoid a
+    // divide-by-zero on an empty warehouse.
+    const [[inv_totals]] = await db.query(`
+      SELECT COALESCE(SUM(qty * purchase_rate), 0) AS inventory_asset_value,
+             COALESCE(SUM(qty * sale_rate),     0) AS estimated_retail_value
+        FROM inventory
+    `);
     const [recent_sales] = await db.query(`SELECT s.invoice_no, s.date, s.total_amount, c.name as customer_name FROM sales s JOIN customers c ON s.customer_id=c.id ORDER BY s.date DESC LIMIT 5`);
     const [top_products] = await db.query(`SELECT p.name, SUM(si.qty) as total_qty FROM sale_items si JOIN products p ON si.product_id=p.id GROUP BY p.id, p.name ORDER BY total_qty DESC LIMIT 5`);
 
@@ -68,6 +76,9 @@ app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {
       total_payable: parseFloat(total_payable),
       low_stock_count: low_stock[0].cnt,
       pending_tax: parseFloat(pending_tax),
+      inventory_asset_value:  parseFloat(inv_totals.inventory_asset_value),
+      estimated_retail_value: parseFloat(inv_totals.estimated_retail_value),
+      estimated_gross_profit: parseFloat(inv_totals.estimated_retail_value) - parseFloat(inv_totals.inventory_asset_value),
       recent_sales,
       top_products
     });
