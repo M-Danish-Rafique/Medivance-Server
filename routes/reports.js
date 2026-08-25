@@ -1562,25 +1562,25 @@ function generateSaleAndStockReportPDF(res, {
   // in-flow columns without index math drifting.
   const inflowDefs =
     mode === 'split'    ? [
-      { key: 'pur',    label: 'Pur.',      w: 30, align: 'right' },
-      { key: 'adj',    label: 'Adj.',      w: 30, align: 'right' },
+      { key: 'pur',    label: 'Pur.',      w: 42, align: 'right' },
+      { key: 'adj',    label: 'Adj.',      w: 42, align: 'right' },
     ]
     : mode === 'combined' ? [
-      { key: 'inflow', label: 'Pur./Adj.',  w: 44, align: 'right' },
+      { key: 'inflow', label: 'Pur./Adj.',  w: 58, align: 'right' },
     ]
     : [];
 
   const colDefs = [
     { key: 'sr',    label: 'Sr',          w: 22 },
     { key: 'name',  label: 'Product',     w: 'flex' },
-    { key: 'pack',  label: 'Pack',        w: 32 },
-    { key: 'open',  label: 'Opening',     w: 40, align: 'right' },
+    { key: 'pack',  label: 'Pack',        w: 40 },
+    { key: 'open',  label: 'Opening',     w: 48, align: 'right' },
     ...inflowDefs,
-    { key: 'gross', label: 'Gross',       w: 38, align: 'right' },
-    { key: 'ret',   label: 'Return',      w: 36, align: 'right' },
-    { key: 'netu',  label: 'Net',         w: 30, align: 'right' },
-    { key: 'netv',  label: 'Net (Value)', w: 64, align: 'right' },
-    { key: 'close', label: 'Closing',     w: 42, align: 'right' },
+    { key: 'gross', label: 'Gross',       w: 48, align: 'right' },
+    { key: 'ret',   label: 'Return',      w: 46, align: 'right' },
+    { key: 'netu',  label: 'Net',         w: 44, align: 'right' },
+    { key: 'netv',  label: 'Net (Value)', w: 68, align: 'right' },
+    { key: 'close', label: 'Closing',     w: 48, align: 'right' },
   ];
 
   const cols   = buildPdfColumns(left, contentWidth, colDefs);
@@ -1674,6 +1674,378 @@ function generateSaleAndStockReportPDF(res, {
     if (!c) return; // column not present in this mode (pur/adj/inflow)
     doc.text(totalCells[key], c.x + 2, y, { width: c.w - 4, align: 'right', lineBreak: false });
   });
+
+  stampPdfFootersOnAllPages(doc, footerOpts);
+  doc.flushPages();
+  doc.end();
+}
+
+// ─── Batch Activity Report ──────────────────────────────────────────────────
+//
+// Per-(product, batch) activity register: every sale line drawn from the
+// specified batch within the date window, alongside its customer, ship-to
+// address, gross line value, return value, and received (= gross − return).
+// Feeds both a modern on-screen layout (executive header card + summary
+// TL;DR metrics + zebra-striped, borderless table) and a PDF that mirrors
+// that shape for print/share.
+//
+// Semantics used here (kept intentionally simple to match spec):
+//   Gross    = sale_items.total                          (line total, tax-in)
+//   Return   = SUM(return_items.return_amount) per sale_item
+//   Received = Gross − Return                            (per row + totals)
+//
+// "Received" is defined here strictly as Gross − Return per the report
+// spec — it is NOT the recovered cash (which lives on
+// sales.total_recovered / sale_items.recovered_amount and is the concept
+// used elsewhere in the app). This report is about "what did the batch
+// physically flow out for, net of returns", not about cash collection.
+
+async function fetchBatchActivityData({ product_id, batch_no, from_date, to_date }) {
+  if (!product_id || !batch_no) {
+    const err = new Error('product_id and batch_no are required');
+    err.status = 400;
+    throw err;
+  }
+
+  // Product + batch meta. Batch row is optional — a fully consumed batch
+  // may no longer exist in inventory, but its history in sale_items still
+  // matters. In that case status falls through to 'Closed'.
+  const [[product]] = await db.query(
+    `SELECT p.id, p.name, p.pack_size, COALESCE(co.name, '') AS company_name
+       FROM products p
+       LEFT JOIN companies co ON co.id = p.company_id
+      WHERE p.id = ?`, [product_id]
+  );
+  if (!product) {
+    const err = new Error('Product not found');
+    err.status = 404;
+    throw err;
+  }
+
+  const [invRows] = await db.query(
+    `SELECT batch_no, qty, exp_date, sale_rate, retail_price
+       FROM inventory WHERE product_id = ? AND batch_no = ?`,
+    [product_id, batch_no]
+  );
+  const invRow = invRows[0] || null;
+
+  // Active/Closed: matches isBatchActive() in backend/inventory.js — qty>0
+  // AND expiry (year+month) not yet past. If no inventory row exists at
+  // all, the batch is treated as Closed.
+  let status = 'Closed';
+  if (invRow) {
+    const qty = parseFloat(invRow.qty) || 0;
+    let expired = false;
+    if (invRow.exp_date) {
+      const expYM = String(invRow.exp_date).slice(0, 7);
+      // Use PKT for the "today" boundary since batch expiry decisions are
+      // day-of-month-agnostic and PKT is the app's authoritative TZ.
+      const todayYM = require('../utils/dateUtils').todayPKT().slice(0, 7);
+      expired = expYM < todayYM;
+    }
+    status = (qty > 0 && !expired) ? 'Active' : 'Closed';
+  }
+
+  // Activity rows. Ship-to = customer.address, falling back to the
+  // area/city composition so a blank address doesn't leave a dead cell.
+  const params = [product_id, batch_no];
+  let sql = `
+    SELECT
+      s.id            AS sale_id,
+      s.date          AS date,
+      s.invoice_no    AS invoice_no,
+      cu.name         AS customer_name,
+      COALESCE(NULLIF(TRIM(cu.address), ''),
+               NULLIF(TRIM(CONCAT_WS(', ', a.name, ci.name)), ''),
+               '')    AS ship_to,
+      si.total        AS gross,
+      COALESCE(ri.ret, 0) AS return_amount
+    FROM sale_items si
+    JOIN sales     s  ON s.id = si.sale_id
+    JOIN customers cu ON cu.id = s.customer_id
+    LEFT JOIN cities ci ON ci.id = cu.city_id
+    LEFT JOIN areas  a  ON a.id  = cu.area_id
+    LEFT JOIN (
+      SELECT sale_item_id, SUM(return_amount) AS ret
+        FROM return_items
+       GROUP BY sale_item_id
+    ) ri ON ri.sale_item_id = si.id
+    WHERE si.product_id = ? AND si.batch_no = ?
+  `;
+  if (from_date) { sql += ' AND s.date >= ?'; params.push(from_date); }
+  if (to_date)   { sql += ' AND s.date <= ?'; params.push(to_date);   }
+  sql += ' ORDER BY s.date ASC, s.id ASC';
+
+  const [raw] = await db.query(sql, params);
+
+  const money2 = (n) => Math.round(parseFloat(n || 0) * 100) / 100;
+  const rows = raw.map(r => {
+    const gross = money2(r.gross);
+    const ret   = money2(r.return_amount);
+    return {
+      sale_id:       r.sale_id,
+      date:          r.date,
+      invoice_no:    r.invoice_no,
+      customer_name: r.customer_name || '',
+      ship_to:       r.ship_to || '',
+      gross,
+      return_amount: ret,
+      received:      money2(gross - ret),
+    };
+  });
+
+  const totals = rows.reduce((t, r) => ({
+    gross:    money2(t.gross    + r.gross),
+    ret:      money2(t.ret      + r.return_amount),
+    received: money2(t.received + r.received),
+  }), { gross: 0, ret: 0, received: 0 });
+
+  return {
+    meta: {
+      product_id:    product.id,
+      product_name:  product.name,
+      pack_size:     product.pack_size || '',
+      company_name:  product.company_name || '',
+      batch_no:      batch_no,
+      exp_date:      invRow ? invRow.exp_date : null,
+      current_qty:   invRow ? (parseInt(invRow.qty, 10) || 0) : 0,
+      status,
+      from_date:     from_date || null,
+      to_date:       to_date   || null,
+    },
+    rows,
+    totals,
+  };
+}
+
+router.get('/batch-activity', auth, async (req, res) => {
+  try {
+    const { product_id, batch_no, from_date, to_date } = req.query;
+    const data = await fetchBatchActivityData({ product_id, batch_no, from_date, to_date });
+    res.json(data);
+  } catch (err) {
+    res.status(err.status || 500).json({ message: err.message });
+  }
+});
+
+router.get('/batch-activity/pdf', auth, async (req, res) => {
+  try {
+    const { product_id, batch_no, from_date, to_date } = req.query;
+    const data = await fetchBatchActivityData({ product_id, batch_no, from_date, to_date });
+    const [[company]] = await db.query('SELECT * FROM company_settings WHERE id=1');
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="batch-activity-${String(batch_no).replace(/[^a-z0-9]+/gi, '-')}.pdf"`
+    );
+    generateBatchActivityPDF(res, { data, company });
+  } catch (err) {
+    res.status(err.status || 500).json({ message: err.message });
+  }
+});
+
+// ─── generateBatchActivityPDF ──────────────────────────────────────────────
+//
+// Layout mirrors the on-screen report so print output matches what the
+// operator saw when they clicked Download:
+//
+//   1. Standard report header (company + title).
+//   2. Executive metadata card — Product / Batch / Company · Pack /
+//      Date Range / Status / Generated On — 3-column grid inside a
+//      light-bordered box (no harsh black frames).
+//   3. Summary metrics strip — Total Gross | Total Returns | Net
+//      Received — bold, callout-style, so the exec sees totals without
+//      hunting the table.
+//   4. Data table — Seq / Date / Invoice / Customer / Ship-To / Gross /
+//      Return / Received — subtle horizontal dividers, NO vertical
+//      grid, zebra-striped rows (very light tint), bold total row at
+//      the bottom.
+function generateBatchActivityPDF(res, { data, company }) {
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
+  doc.pipe(res);
+
+  const { meta, rows, totals } = data;
+  const companyName = company?.name || 'Medivance';
+  const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+  const footerOpts  = { left, right, contentWidth, companyName };
+
+  // Palette — light, print-friendly. Grays for structure, no color-coded
+  // semantics (the report gets photocopied/printed on b/w hardware).
+  const GRAY_LINE   = '#d7dee6';   // horizontal dividers
+  const GRAY_LABEL  = '#6b7280';   // metadata labels
+  const GRAY_TEXT   = '#111827';   // metadata values
+  const ZEBRA_TINT  = '#f7f9fb';   // alternating row background
+
+  let y = drawReportHeader(doc, {
+    company, title: 'BATCH ACTIVITY REPORT',
+    subtitle: 'Product · Batch · Sales Activity',
+    left, right, contentWidth,
+  });
+
+  // ── 1) Executive metadata card ───────────────────────────────────────
+  // 3-column key/value grid inside a soft-bordered rectangle. Keeps the
+  // "at-a-glance" info visually separated from the table below.
+  const metaCol = contentWidth / 3;
+  const metaRowH = 26;
+  const metaBoxH = metaRowH * 2 + 16; // two rows + top/bottom padding
+
+  doc.strokeColor(GRAY_LINE).lineWidth(0.75);
+  doc.roundedRect(left, y, contentWidth, metaBoxH, 6).stroke();
+
+  const drawMeta = (col, row, label, value) => {
+    const cx = left + col * metaCol + 12;
+    const cy = y + 10 + row * metaRowH;
+    doc.font('Helvetica').fontSize(7.5).fillColor(GRAY_LABEL)
+       .text(String(label).toUpperCase(), cx, cy, { width: metaCol - 24, lineBreak: false });
+    doc.font('Helvetica-Bold').fontSize(10).fillColor(GRAY_TEXT)
+       .text(String(value ?? '—'), cx, cy + 10, { width: metaCol - 24, lineBreak: false, ellipsis: true });
+  };
+
+  const productLine  = meta.product_name + (meta.pack_size ? `  ·  ${meta.pack_size}` : '');
+  const companyLine  = meta.company_name || '—';
+  const dateRange    = `${meta.from_date || 'Beginning'}  →  ${meta.to_date || 'Present'}`;
+  const generatedOn  = formatDatePKT(new Date());
+  const expDateStr   = meta.exp_date ? formatDatePKT(meta.exp_date) : '—';
+
+  drawMeta(0, 0, 'Product',       productLine);
+  drawMeta(1, 0, 'Batch Number',  meta.batch_no);
+  drawMeta(2, 0, 'Company',       companyLine);
+  drawMeta(0, 1, 'Date Range',    dateRange);
+  drawMeta(1, 1, 'Batch Expiry',  expDateStr);
+  drawMeta(2, 1, 'Status',        meta.status);
+
+  y += metaBoxH + 6;
+
+  // Generated-on note under the card, right-aligned, unobtrusive.
+  doc.font('Helvetica').fontSize(8).fillColor(GRAY_LABEL)
+     .text(`Report generated on ${generatedOn}`, left, y, { width: contentWidth, align: 'right', lineBreak: false });
+  y += 16;
+  doc.fillColor('#000');
+
+  // ── 2) Summary metrics strip (TL;DR callouts) ────────────────────────
+  const metricCount = 3;
+  const metricGap = 8;
+  const metricW = (contentWidth - metricGap * (metricCount - 1)) / metricCount;
+  const metricH = 46;
+  const drawMetric = (i, label, value) => {
+    const mx = left + i * (metricW + metricGap);
+    doc.strokeColor(GRAY_LINE).lineWidth(0.75);
+    doc.roundedRect(mx, y, metricW, metricH, 6).stroke();
+    doc.font('Helvetica').fontSize(8).fillColor(GRAY_LABEL)
+       .text(String(label).toUpperCase(), mx + 12, y + 8, { width: metricW - 24, lineBreak: false });
+    doc.font('Helvetica-Bold').fontSize(15).fillColor(GRAY_TEXT)
+       .text(value, mx + 12, y + 22, { width: metricW - 24, lineBreak: false });
+  };
+  const fmtMoney = (n) => Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  drawMetric(0, 'Total Gross',   fmtMoney(totals.gross));
+  drawMetric(1, 'Total Returns', fmtMoney(totals.ret));
+  drawMetric(2, 'Net Received',  fmtMoney(totals.received));
+  y += metricH + 14;
+  doc.fillColor('#000');
+
+  // ── 3) Data table ────────────────────────────────────────────────────
+  // Widths match the spec's percentages (Seq 4 / Date 8 / Invoice 10 /
+  // Customer 20 / Ship-To 27 / Gross 10 / Return 10 / Received 10 = 99;
+  // the tiny remainder is absorbed by Ship-To via buildPdfColumns's flex).
+  const cols = buildPdfColumns(left, contentWidth, [
+    { key: 'seq',     label: 'Seq',        w: Math.round(contentWidth * 0.04), align: 'right' },
+    { key: 'date',    label: 'Date',       w: Math.round(contentWidth * 0.09) },
+    { key: 'invoice', label: 'Invoice No', w: Math.round(contentWidth * 0.10) },
+    { key: 'cust',    label: 'Customer',   w: Math.round(contentWidth * 0.20) },
+    { key: 'ship',    label: 'Ship-To',    w: 'flex' },
+    { key: 'gross',   label: 'Gross',      w: Math.round(contentWidth * 0.10), align: 'right' },
+    { key: 'return',  label: 'Return',     w: Math.round(contentWidth * 0.10), align: 'right' },
+    { key: 'recv',    label: 'Received',   w: Math.round(contentWidth * 0.10), align: 'right' },
+  ]);
+
+  const pageBottom = getPdfContentBottom(doc);
+
+  function drawHdr(yy) {
+    // Modern: single subtle divider under headers, no top rule, no vertical rules.
+    doc.font('Helvetica-Bold').fontSize(TABLE_HDR_FONT_SIZE).fillColor(GRAY_LABEL);
+    cols.forEach(c =>
+      doc.text(String(c.label).toUpperCase(), c.x + 2, yy + TABLE_TOP_PAD,
+        { width: c.w - 4, align: c.align, lineBreak: false })
+    );
+    doc.strokeColor(GRAY_LINE).lineWidth(0.75);
+    doc.moveTo(left, yy + TABLE_HDR_H).lineTo(right, yy + TABLE_HDR_H).stroke();
+    doc.fillColor('#000');
+    return yy + TABLE_HDR_H;
+  }
+
+  y = drawHdr(y);
+
+  if (rows.length === 0) {
+    doc.font('Helvetica-Oblique').fontSize(TABLE_FONT_SIZE).fillColor(GRAY_LABEL)
+       .text('No activity for this batch in the selected period.',
+             left, y + 12, { width: contentWidth, align: 'center', lineBreak: false });
+    y += 30;
+  } else {
+    rows.forEach((row, i) => {
+      const seqStr     = String(i + 1);
+      const dateStr    = formatDatePKT(row.date); // standardized display
+      const invoiceStr = row.invoice_no || '—';
+      const custStr    = row.customer_name || '—';
+      const shipStr    = row.ship_to || '—';
+      const grossStr   = fmtMoney(row.gross);
+      const retStr     = row.return_amount > 0 ? fmtMoney(row.return_amount) : '—';
+      const recvStr    = fmtMoney(row.received);
+
+      // Measure using ship-to (the wrapping-prone column) as the driver;
+      // customer can wrap too but is narrower. Keeps every row tall enough
+      // to hold its own address without clipping.
+      doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
+      const rowH = measureRowHeight(doc, [
+        { text: custStr, width: cols[3].w - 4 },
+        { text: shipStr, width: cols[4].w - 4 },
+      ], TABLE_MIN_ROW);
+
+      if (y + rowH > pageBottom) {
+        doc.addPage();
+        y = doc.page.margins.top;
+        y = drawHdr(y);
+      }
+
+      // Zebra stripe — very light tint on even rows.
+      if (i % 2 === 1) {
+        doc.save();
+        doc.rect(left, y, contentWidth, rowH).fill(ZEBRA_TINT);
+        doc.restore();
+      }
+
+      doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor(GRAY_TEXT);
+      doc.text(seqStr,     cols[0].x + 2, y + TABLE_TOP_PAD, { width: cols[0].w - 4, align: 'right', lineBreak: false });
+      doc.text(dateStr,    cols[1].x + 2, y + TABLE_TOP_PAD, { width: cols[1].w - 4, lineBreak: false });
+      // Invoice column: monospace-ish (Courier) so serials line up vertically.
+      doc.font('Courier').fontSize(TABLE_FONT_SIZE)
+         .text(invoiceStr, cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
+      doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
+      doc.text(custStr,    cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4 });
+      doc.text(shipStr,    cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4 });
+      doc.text(grossStr,   cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+      doc.text(retStr,     cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+      doc.text(recvStr,    cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+
+      // Subtle horizontal divider under each row (no vertical rules ever).
+      doc.strokeColor(GRAY_LINE).lineWidth(0.5);
+      doc.moveTo(left, y + rowH).lineTo(right, y + rowH).stroke();
+      y += rowH;
+    });
+  }
+
+  // ── 4) Bolded bottom total row ───────────────────────────────────────
+  y = ensureSpace(doc, y + 6, 22);
+  doc.strokeColor(GRAY_LINE).lineWidth(1);
+  doc.moveTo(left, y - 4).lineTo(right, y - 4).stroke();
+  doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE + 0.5).fillColor(GRAY_TEXT);
+  // "TOTAL" spans up to the Ship-To column so it visually anchors under
+  // the descriptive columns and stops just before the numeric block.
+  const labelStartX = cols[0].x + 2;
+  const labelWidth  = cols[5].x - labelStartX - 4;
+  doc.text('TOTAL', labelStartX, y + TABLE_TOP_PAD, { width: labelWidth, lineBreak: false });
+  doc.text(fmtMoney(totals.gross),    cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(fmtMoney(totals.ret),      cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(fmtMoney(totals.received), cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
 
   stampPdfFootersOnAllPages(doc, footerOpts);
   doc.flushPages();
