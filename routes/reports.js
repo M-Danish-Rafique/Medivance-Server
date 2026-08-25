@@ -1684,13 +1684,20 @@ function generateSaleAndStockReportPDF(res, {
 //
 // Per-(product, batch) activity register: one row per sale line drawn from
 // the specified batch in the date window, alongside customer, ship-to
-// address, gross line value, return, and received (= gross − return).
+// address, and the QUANTITIES that flowed for this batch:
 //
-// "Received" is defined here strictly as Gross − Return per the report
-// spec — it is NOT recovered cash (which lives on sales.total_recovered /
-// sale_items.recovered_amount and is what other reports mean by
-// "Recovered"). This report is about "what the batch physically flowed
-// out for, net of returns", not about cash collection.
+//   Gross Qty    = sale_items.qty + sale_items.bonus   (bonus units come
+//                                                        off the shelves,
+//                                                        so they count —
+//                                                        matches the Sale
+//                                                        & Stock report's
+//                                                        gross definition)
+//   Return Qty   = SUM(return_items.qty_returned) per sale_item
+//   Received Qty = Gross Qty − Return Qty
+//
+// This report is deliberately about UNITS moved, not money — the operator
+// uses it to reconcile physical batch flow (invoiced vs. returned vs.
+// kept). Values live in other reports (Sales / Sale Summary).
 
 async function fetchBatchActivityData({ product_id, batch_no, from_date, to_date }) {
   if (!product_id || !batch_no) {
@@ -1711,15 +1718,15 @@ async function fetchBatchActivityData({ product_id, batch_no, from_date, to_date
       COALESCE(NULLIF(TRIM(cu.address), ''),
                NULLIF(TRIM(CONCAT_WS(', ', a.name, ci.name)), ''),
                '')    AS ship_to,
-      si.total        AS gross,
-      COALESCE(ri.ret, 0) AS return_amount
+      (COALESCE(si.qty, 0) + COALESCE(si.bonus, 0)) AS gross_qty,
+      COALESCE(ri.ret_qty, 0)                        AS return_qty
     FROM sale_items si
     JOIN sales     s  ON s.id = si.sale_id
     JOIN customers cu ON cu.id = s.customer_id
     LEFT JOIN cities ci ON ci.id = cu.city_id
     LEFT JOIN areas  a  ON a.id  = cu.area_id
     LEFT JOIN (
-      SELECT sale_item_id, SUM(return_amount) AS ret
+      SELECT sale_item_id, SUM(COALESCE(qty_returned, 0)) AS ret_qty
         FROM return_items
        GROUP BY sale_item_id
     ) ri ON ri.sale_item_id = si.id
@@ -1731,27 +1738,26 @@ async function fetchBatchActivityData({ product_id, batch_no, from_date, to_date
 
   const [raw] = await db.query(sql, params);
 
-  const money2 = (n) => Math.round(parseFloat(n || 0) * 100) / 100;
   const rows = raw.map(r => {
-    const gross = money2(r.gross);
-    const ret   = money2(r.return_amount);
+    const gross = parseInt(r.gross_qty,  10) || 0;
+    const ret   = parseInt(r.return_qty, 10) || 0;
     return {
       sale_id:       r.sale_id,
       date:          r.date,
       invoice_no:    r.invoice_no,
       customer_name: r.customer_name || '',
       ship_to:       r.ship_to || '',
-      gross,
-      return_amount: ret,
-      received:      money2(gross - ret),
+      gross_qty:     gross,
+      return_qty:    ret,
+      received_qty:  gross - ret,
     };
   });
 
   const totals = rows.reduce((t, r) => ({
-    gross:    money2(t.gross    + r.gross),
-    ret:      money2(t.ret      + r.return_amount),
-    received: money2(t.received + r.received),
-  }), { gross: 0, ret: 0, received: 0 });
+    gross_qty:    t.gross_qty    + r.gross_qty,
+    return_qty:   t.return_qty   + r.return_qty,
+    received_qty: t.received_qty + r.received_qty,
+  }), { gross_qty: 0, return_qty: 0, received_qty: 0 });
 
   return { rows, totals };
 }
@@ -1802,6 +1808,13 @@ router.get('/batch-activity/pdf', auth, async (req, res) => {
 // Mirrors generateSalesReportPDF: same header + filter box, same
 // column-driven table (buildPdfColumns), same TABLE_* typography, same
 // TOTAL row placement. Only the column set and filter labels differ.
+//
+// Column widths are chosen so Customer gets meaningfully more room than
+// Ship-To: customers are the primary identifier the operator scans down,
+// while ship-to addresses are secondary context that can afford to wrap.
+// Both text columns still wrap freely (measureRowHeight grows the row),
+// so long addresses print in full without being truncated. Qty columns
+// are narrower than money columns would be — they only hold integers.
 
 function generateBatchActivityPDF(res, {
   rows, totals, from_date, to_date, productLabel, batchLabel, company,
@@ -1827,19 +1840,20 @@ function generateBatchActivityPDF(res, {
     ],
   });
 
-  // Column widths follow the Sales-report shape: fixed-width Sr / Date /
-  // Invoice / numeric columns, flex Customer, plus a flex-narrower
-  // Ship-To. We give Ship-To a fixed generous width so long addresses
-  // wrap in place rather than pushing everything else.
+  // Layout: Customer is the flex column so it soaks up any remaining
+  // horizontal space (widest of the text columns). Ship-To has a fixed
+  // width tuned to hold typical Pakistani pharmacy addresses in 2-3
+  // wrapped lines without stealing space from Customer. Qty columns
+  // are integer-only, so 44pt is plenty (fits 6-digit qtys comfortably).
   const cols = buildPdfColumns(left, contentWidth, [
-    { label: 'Sr',       w: 18 },
-    { label: 'Date',     w: 54 },
-    { label: 'Invoice',  w: 60 },
-    { label: 'Customer', w: 'flex' },
-    { label: 'Ship-To',  w: 150 },
-    { label: 'Gross',    w: 62, align: 'right' },
-    { label: 'Return',   w: 52, align: 'right' },
-    { label: 'Received', w: 62, align: 'right' },
+    { label: 'Sr',           w: 20 },
+    { label: 'Date',         w: 54 },
+    { label: 'Invoice',      w: 58 },
+    { label: 'Customer',     w: 'flex' },
+    { label: 'Ship-To',      w: 118 },
+    { label: 'Gross Qty',    w: 46, align: 'right' },
+    { label: 'Return Qty',   w: 46, align: 'right' },
+    { label: 'Received Qty', w: 54, align: 'right' },
   ]);
 
   const pageBottom = getPdfContentBottom(doc);
@@ -1857,18 +1871,18 @@ function generateBatchActivityPDF(res, {
   y = drawHdr(y);
 
   rows.forEach((row, i) => {
-    const gross = parseFloat(row.gross)         || 0;
-    const ret   = parseFloat(row.return_amount) || 0;
-    const recv  = parseFloat(row.received)      || 0;
+    const gross = parseInt(row.gross_qty,    10) || 0;
+    const ret   = parseInt(row.return_qty,   10) || 0;
+    const recv  = parseInt(row.received_qty, 10) || 0;
 
     const srStr      = String(i + 1);
     const dateStr    = formatDatePKT(row.date);
     const invoiceStr = row.invoice_no    || '\u2014';
     const custStr    = row.customer_name || '\u2014';
     const shipStr    = row.ship_to       || '\u2014';
-    const grossStr   = gross.toFixed(2);
-    const retStr     = ret > 0 ? ret.toFixed(2) : '\u2014';
-    const recvStr    = recv.toFixed(2);
+    const grossStr   = String(gross);
+    const retStr     = ret > 0 ? String(ret) : '\u2014';
+    const recvStr    = String(recv);
 
     // Must set font before measuring
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
@@ -1876,8 +1890,8 @@ function generateBatchActivityPDF(res, {
       { text: srStr,      width: cols[0].w - 4 },
       { text: dateStr,    width: cols[1].w - 4 },
       { text: invoiceStr, width: cols[2].w - 4 },
-      { text: custStr,    width: cols[3].w - 4 },  // flex col — most likely to wrap
-      { text: shipStr,    width: cols[4].w - 4 },  // also wraps
+      { text: custStr,    width: cols[3].w - 4 },  // flex col — wraps
+      { text: shipStr,    width: cols[4].w - 4 },  // fixed 118pt — wraps
       { text: grossStr,   width: cols[5].w - 4 },
       { text: retStr,     width: cols[6].w - 4 },
       { text: recvStr,    width: cols[7].w - 4 },
@@ -1902,10 +1916,10 @@ function generateBatchActivityPDF(res, {
   y = ensureSpace(doc, y, 24);
 
   doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
-  doc.text('TOTAL',                       cols[3].x + 2, y, { width: cols[3].w - 4,  lineBreak: false });
-  doc.text((totals.gross    || 0).toFixed(2), cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
-  doc.text((totals.ret      || 0).toFixed(2), cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
-  doc.text((totals.received || 0).toFixed(2), cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+  doc.text('TOTAL',                                cols[3].x + 2, y, { width: cols[3].w - 4, lineBreak: false });
+  doc.text(String(totals.gross_qty    || 0),       cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.return_qty   || 0),       cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.received_qty || 0),       cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
 
   stampPdfFootersOnAllPages(doc, footerOpts);
   doc.flushPages();
