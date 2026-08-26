@@ -1926,5 +1926,288 @@ function generateBatchActivityPDF(res, {
   doc.end();
 }
 
+// ─── Product Sales Report data ─────────────────────────────────────────────
+//
+// One row per product with any sales activity in the window. Aggregates
+// at product grain (not company / not batch), so a product sold across
+// multiple batches contributes ONE row with summed qty / revenue / cost.
+//
+// Definitions (locked with the user — do not "improve" without asking):
+//
+//   Return date basis  = sale-date window. A return counts only if the
+//                        parent invoice is dated in the window; when it
+//                        was actually processed is irrelevant. This lets
+//                        us use `sale_items.returned_qty` (cumulative
+//                        all-time) safely: since we filter by sales.date
+//                        IN window, every included sale_item's returns
+//                        (all of which happened at or after the sale
+//                        date) belong to the window's activity.
+//
+//   Gross Qty          = SUM(si.qty + si.bonus)
+//                        Bonus units come off the shelf, so they count
+//                        (same convention as Sale & Stock / Batch
+//                        Activity).
+//
+//   Return Qty         = SUM(si.returned_qty)
+//   Net Sold Qty       = Gross Qty − Return Qty
+//
+//   Net Revenue        = SUM(si.total − si.recovery_discount)
+//                        − SUM(return_items.return_amount)
+//                        Matches the Sale Summary report's "Net" column.
+//                        Billed revenue view — independent of whether
+//                        cash was collected.
+//
+//   COGS               = SUM((si.qty + si.bonus − si.returned_qty)
+//                            × si.purchase_rate_snapshot)
+//                        Uses the frozen per-line snapshot (AGENTS.md-
+//                        blessed cost basis — Profit report depends on
+//                        it). Bonus units are costed (they came off the
+//                        shelf at that batch's cost).
+//
+//   Gross Profit       = Net Revenue − COGS
+//
+// Line-level items with NULL purchase_rate_snapshot (legacy pre-2026
+// invoices) contribute 0 COGS. These lines will visibly inflate Gross
+// Profit but there's no cost history to reconstruct them — we don't
+// silently paper over it. The frontend can optionally flag them; the
+// backend just returns the honest number.
+
+async function fetchProductSalesData({ from_date, to_date, company_id }) {
+  if (!from_date || !to_date) {
+    const err = new Error('from_date and to_date are required');
+    err.status = 400;
+    throw err;
+  }
+
+  const params = [from_date, to_date];
+  let sql = `
+    SELECT
+      p.id                                                       AS product_id,
+      p.name                                                     AS product_name,
+      p.pack_size                                                AS pack_size,
+
+      SUM(COALESCE(si.qty, 0) + COALESCE(si.bonus, 0))           AS gross_qty,
+      SUM(COALESCE(si.returned_qty, 0))                          AS return_qty,
+      SUM(COALESCE(si.qty, 0) + COALESCE(si.bonus, 0)
+          - COALESCE(si.returned_qty, 0))                        AS net_qty,
+
+      /* Net Revenue: billed net of recovery discounts and returns.
+         return_items.return_amount is aggregated per sale_item once and
+         joined in, so no double-counting from multi-recovery returns. */
+      SUM(COALESCE(si.total, 0) - COALESCE(si.recovery_discount, 0))
+        - COALESCE(SUM(ri_agg.return_amount_total), 0)           AS net_revenue,
+
+      /* COGS: frozen snapshot × units ultimately kept off the shelf
+         (paid + bonus − returned). Lines with NULL snapshot contribute 0
+         — see report header comment. */
+      SUM(
+        (COALESCE(si.qty, 0) + COALESCE(si.bonus, 0) - COALESCE(si.returned_qty, 0))
+        * COALESCE(si.purchase_rate_snapshot, 0)
+      )                                                          AS cogs,
+
+      /* Diagnostic: number of underlying lines with a missing cost
+         basis, surfaced so the UI can flag "COGS partially unknown". */
+      SUM(CASE WHEN si.purchase_rate_snapshot IS NULL THEN 1 ELSE 0 END) AS missing_cost_lines
+    FROM products p
+    JOIN sale_items si ON si.product_id = p.id
+    JOIN sales      s  ON s.id = si.sale_id
+    LEFT JOIN (
+      SELECT sale_item_id, SUM(COALESCE(return_amount, 0)) AS return_amount_total
+        FROM return_items
+       GROUP BY sale_item_id
+    ) ri_agg ON ri_agg.sale_item_id = si.id
+    WHERE s.date BETWEEN ? AND ?
+  `;
+  if (company_id) { sql += ' AND p.company_id = ?'; params.push(company_id); }
+  sql += `
+    GROUP BY p.id, p.name, p.pack_size
+    /* Hide zero-activity products per spec. A row survives if any of
+       gross_qty / return_qty / net_revenue is non-trivially non-zero. */
+    HAVING gross_qty > 0
+        OR return_qty > 0
+        OR ABS(net_revenue) > 0.005
+    ORDER BY p.name ASC
+  `;
+  const [rows] = await db.query(sql, params);
+
+  const money2 = (n) => Math.round(parseFloat(n || 0) * 100) / 100;
+
+  return rows.map(r => {
+    const gross_qty     = parseInt(r.gross_qty,  10) || 0;
+    const return_qty    = parseInt(r.return_qty, 10) || 0;
+    const net_qty       = parseInt(r.net_qty,    10) || 0;
+    const net_revenue   = money2(r.net_revenue);
+    const cogs          = money2(r.cogs);
+    const gross_profit  = money2(net_revenue - cogs);
+    return {
+      product_id:         r.product_id,
+      product_name:       r.product_name,
+      pack_size:          r.pack_size || '',
+      gross_qty,
+      return_qty,
+      net_qty,
+      net_revenue,
+      cogs,
+      gross_profit,
+      missing_cost_lines: parseInt(r.missing_cost_lines, 10) || 0,
+    };
+  });
+}
+
+router.get('/product-sales', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, company_id } = req.query;
+    const rows = await fetchProductSalesData({
+      from_date, to_date, company_id: company_id || null,
+    });
+    res.json({ rows });
+  } catch (err) {
+    res.status(err.status || 500).json({ message: err.message });
+  }
+});
+
+router.get('/product-sales/pdf', auth, async (req, res) => {
+  try {
+    const { from_date, to_date, company_id } = req.query;
+    const rows = await fetchProductSalesData({
+      from_date, to_date, company_id: company_id || null,
+    });
+    const [[company]] = await db.query('SELECT * FROM company_settings WHERE id=1');
+    let companyLabel = 'All Companies';
+    if (company_id) {
+      const [c] = await db.query('SELECT name FROM companies WHERE id=?', [company_id]);
+      companyLabel = c[0]?.name || String(company_id);
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="product-sales-report.pdf"');
+    generateProductSalesPDF(res, { rows, from_date, to_date, companyLabel, company });
+  } catch (err) {
+    res.status(err.status || 500).json({ message: err.message });
+  }
+});
+
+// ─── generateProductSalesPDF ───────────────────────────────────────────────
+//
+// Mirrors generateSalesReportPDF's structure: same header + filter box,
+// same buildPdfColumns / TABLE_* typography, same TOTAL row layout.
+//
+// Column widths tuned so:
+//   - Product Name is the flex column (widest, most needed for scanning).
+//   - Pack is narrow (short strings, rare to overflow).
+//   - Money columns get slightly more room than qty columns because they
+//     can hit 6+ digits with a decimal.
+function generateProductSalesPDF(res, { rows, from_date, to_date, companyLabel, company }) {
+  const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
+  doc.pipe(res);
+
+  const companyName = company?.name || 'Medivance';
+  const left = 40, right = doc.page.width - 40, contentWidth = right - left;
+  const footerOpts  = { left, right, contentWidth, companyName };
+
+  let y = drawReportHeader(doc, {
+    company, title: 'PRODUCT SALES REPORT',
+    subtitle: 'Per-product Revenue, Cost & Profit',
+    left, right, contentWidth,
+  });
+
+  y = drawFilterBox(doc, {
+    left, contentWidth, y,
+    filters: [
+      `Period: ${from_date}  to  ${to_date}`,
+      `Company: ${companyLabel}`,
+    ],
+  });
+
+  const cols = buildPdfColumns(left, contentWidth, [
+    { label: 'Sr',           w: 20 },
+    { label: 'Product',      w: 'flex' },
+    { label: 'Pack',         w: 46 },
+    { label: 'Gross Qty',    w: 46, align: 'right' },
+    { label: 'Return Qty',   w: 46, align: 'right' },
+    { label: 'Net Sold',     w: 46, align: 'right' },
+    { label: 'Net Revenue',  w: 64, align: 'right' },
+    { label: 'COGS',         w: 62, align: 'right' },
+    { label: 'Gross Profit', w: 66, align: 'right' },
+  ]);
+
+  const pageBottom = getPdfContentBottom(doc);
+
+  function drawHdr(yy) {
+    doc.moveTo(left, yy).lineTo(right, yy).lineWidth(1).strokeColor('#000').stroke();
+    doc.font('Helvetica-Bold').fontSize(TABLE_HDR_FONT_SIZE).fillColor('#000');
+    cols.forEach(c =>
+      doc.text(c.label, c.x + 2, yy + TABLE_TOP_PAD, { width: c.w - 4, align: c.align, lineBreak: false })
+    );
+    doc.moveTo(left, yy + TABLE_HDR_H).lineTo(right, yy + TABLE_HDR_H).stroke();
+    return yy + TABLE_HDR_H;
+  }
+
+  y = drawHdr(y);
+  const totals = { gross_qty: 0, return_qty: 0, net_qty: 0, net_revenue: 0, cogs: 0, gross_profit: 0 };
+
+  rows.forEach((row, i) => {
+    totals.gross_qty    += row.gross_qty;
+    totals.return_qty   += row.return_qty;
+    totals.net_qty      += row.net_qty;
+    totals.net_revenue  += row.net_revenue;
+    totals.cogs         += row.cogs;
+    totals.gross_profit += row.gross_profit;
+
+    const srStr        = String(i + 1);
+    const nameStr      = row.product_name || '\u2014';
+    const packStr      = row.pack_size    || '\u2014';
+    const grossStr     = String(row.gross_qty);
+    const retStr       = row.return_qty > 0 ? String(row.return_qty) : '\u2014';
+    const netQtyStr    = String(row.net_qty);
+    const netRevStr    = row.net_revenue.toFixed(2);
+    const cogsStr      = row.cogs.toFixed(2);
+    const gpStr        = row.gross_profit.toFixed(2);
+
+    doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
+    const rowH = measureRowHeight(doc, [
+      { text: srStr,     width: cols[0].w - 4 },
+      { text: nameStr,   width: cols[1].w - 4 },
+      { text: packStr,   width: cols[2].w - 4 },
+      { text: grossStr,  width: cols[3].w - 4 },
+      { text: retStr,    width: cols[4].w - 4 },
+      { text: netQtyStr, width: cols[5].w - 4 },
+      { text: netRevStr, width: cols[6].w - 4 },
+      { text: cogsStr,   width: cols[7].w - 4 },
+      { text: gpStr,     width: cols[8].w - 4 },
+    ], TABLE_MIN_ROW);
+
+    if (y + rowH > pageBottom) { doc.addPage(); y = doc.page.margins.top; y = drawHdr(y); }
+
+    doc.font('Helvetica').fontSize(TABLE_FONT_SIZE).fillColor('#000');
+    doc.text(srStr,     cols[0].x + 2, y + TABLE_TOP_PAD, { width: cols[0].w - 4, lineBreak: false });
+    doc.text(nameStr,   cols[1].x + 2, y + TABLE_TOP_PAD, { width: cols[1].w - 4 }); // wraps freely
+    doc.text(packStr,   cols[2].x + 2, y + TABLE_TOP_PAD, { width: cols[2].w - 4, lineBreak: false });
+    doc.text(grossStr,  cols[3].x + 2, y + TABLE_TOP_PAD, { width: cols[3].w - 4, align: 'right', lineBreak: false });
+    doc.text(retStr,    cols[4].x + 2, y + TABLE_TOP_PAD, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+    doc.text(netQtyStr, cols[5].x + 2, y + TABLE_TOP_PAD, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+    doc.text(netRevStr, cols[6].x + 2, y + TABLE_TOP_PAD, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+    doc.text(cogsStr,   cols[7].x + 2, y + TABLE_TOP_PAD, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+    doc.text(gpStr,     cols[8].x + 2, y + TABLE_TOP_PAD, { width: cols[8].w - 4, align: 'right', lineBreak: false });
+    y += rowH;
+  });
+
+  doc.moveTo(left, y).lineTo(right, y).stroke();
+  y += 8;
+  y = ensureSpace(doc, y, 24);
+
+  doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE);
+  doc.text('TOTAL',                          cols[1].x + 2, y, { width: cols[1].w - 4, lineBreak: false });
+  doc.text(String(totals.gross_qty),         cols[3].x + 2, y, { width: cols[3].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.return_qty),        cols[4].x + 2, y, { width: cols[4].w - 4, align: 'right', lineBreak: false });
+  doc.text(String(totals.net_qty),           cols[5].x + 2, y, { width: cols[5].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.net_revenue.toFixed(2),    cols[6].x + 2, y, { width: cols[6].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.cogs.toFixed(2),           cols[7].x + 2, y, { width: cols[7].w - 4, align: 'right', lineBreak: false });
+  doc.text(totals.gross_profit.toFixed(2),   cols[8].x + 2, y, { width: cols[8].w - 4, align: 'right', lineBreak: false });
+
+  stampPdfFootersOnAllPages(doc, footerOpts);
+  doc.flushPages();
+  doc.end();
+}
+
 
 module.exports = router;
