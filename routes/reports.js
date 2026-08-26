@@ -1852,8 +1852,8 @@ function generateBatchActivityPDF(res, {
     { label: 'Customer',     w: 'flex' },
     { label: 'Ship-To',      w: 118 },
     { label: 'Gross Qty',    w: 46, align: 'right' },
-    { label: 'Return Qty',   w: 46, align: 'right' },
-    { label: 'Received Qty', w: 54, align: 'right' },
+    { label: 'Return Qty',   w: 52, align: 'right' },
+    { label: 'Received Qty', w: 62, align: 'right' },
   ]);
 
   const pageBottom = getPdfContentBottom(doc);
