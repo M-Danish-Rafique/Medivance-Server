@@ -217,10 +217,16 @@ router.get('/:id', auth, async (req, res) => {
     // "smart default" invoice type per-invoice (licensed → warranty,
     // non-licensed → non-warranty). Same rule the print_queue seed used
     // before it was removed.
+    //
+    // `c.ntn` and `c.strn` carry the customer's Pakistan tax identifiers
+    // (clean digits; formatting is applied by frontend/TaxIdInput's
+    // exported `formatTaxId` when the invoice renders). InvoiceDocument
+    // hides both the label and the value when either is NULL/empty.
     const [rows] = await db.query(`
       SELECT s.*, DATE_FORMAT(s.date, '%Y-%m-%d') AS date,
              c.name as customer_name, c.address as customer_address, c.phone as customer_phone,
              c.license_no, c.license_expiry, c.is_licensed,
+             c.ntn, c.strn,
              e.name as salesman_name,
              d.name as delivery_by_name,
              ci.name as city_name, a.name as area_name, t.name as territory_name
