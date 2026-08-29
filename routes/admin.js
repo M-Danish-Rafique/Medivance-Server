@@ -25,12 +25,21 @@ router.get('/company', async (req, res) => {
 
 router.put('/company', auth, adminOnly, async (req, res) => {
   try {
-    const { name, address, phone, email, logo_url } = req.body;
+    // `signature_url` is optional — added by 2026-08-29_company_signature.
+    // The client posts either a base64 data URL (PNG/JPG, <=500 KB after
+    // client-side validation) or an empty string when the admin removes
+    // it. We audit-log only the top-level metadata change; the raw
+    // signature payload is intentionally NOT copied into audit_logs to
+    // keep that table small.
+    const { name, address, phone, email, logo_url, signature_url } = req.body;
     await db.query(
-      `INSERT INTO company_settings (id, name, address, phone, email, logo_url) VALUES (1,?,?,?,?,?)
+      `INSERT INTO company_settings (id, name, address, phone, email, logo_url, signature_url)
+         VALUES (1,?,?,?,?,?,?)
        ON DUPLICATE KEY UPDATE name=VALUES(name), address=VALUES(address),
-         phone=VALUES(phone), email=VALUES(email), logo_url=VALUES(logo_url)`,
-      [name, address || null, phone || null, email || null, logo_url || null]
+         phone=VALUES(phone), email=VALUES(email), logo_url=VALUES(logo_url),
+         signature_url=VALUES(signature_url)`,
+      [name, address || null, phone || null, email || null,
+       logo_url || null, signature_url || null]
     );
     await logAudit(req, 'UPDATE', 'company_settings', 1, `Updated company details to "${name}"`);
     const [[updated]] = await db.query('SELECT * FROM company_settings WHERE id=1');
