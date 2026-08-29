@@ -54,7 +54,7 @@ router.get('/:id', auth, async (req, res) => {
 
 router.post('/', auth, async (req, res) => {
   try {
-    const { name, address, phone, license_no, license_expiry, city_id, area_id, territory_id, is_licensed } = req.body;
+    const { name, address, phone, license_no, license_expiry, city_id, area_id, territory_id, is_licensed, ntn, strn } = req.body;
     if (!name) return res.status(400).json({ message: 'Customer name required' });
 
     const isDuplicate = await findDuplicateCustomer(db, { name, city_id, area_id, territory_id });
@@ -62,26 +62,38 @@ router.post('/', auth, async (req, res) => {
       return res.status(409).json({ message: 'A customer with this name already exists in the selected City, Area and Territory.' });
     }
 
+    // Tax IDs are canonically stored as clean digits (no dashes) — the
+    // presentation-layer TaxIdInput / formatTaxId handles masking on the
+    // way in and out. Any stray non-digit that slips through the UI is
+    // stripped here as a defence-in-depth safeguard.
+    const cleanNtn  = ntn  ? String(ntn).replace(/\D/g, '')  : null;
+    const cleanStrn = strn ? String(strn).replace(/\D/g, '') : null;
+
     const [result] = await db.query(
-      'INSERT INTO customers (name, address, phone, license_no, license_expiry, city_id, area_id, territory_id, is_licensed) VALUES (?,?,?,?,?,?,?,?,?)',
-      [name, address, phone, license_no || null, license_expiry || null, city_id || null, area_id || null, territory_id || null, is_licensed ? 1 : 0]
+      'INSERT INTO customers (name, address, phone, license_no, license_expiry, city_id, area_id, territory_id, is_licensed, ntn, strn) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+      [name, address, phone, license_no || null, license_expiry || null, city_id || null, area_id || null, territory_id || null, is_licensed ? 1 : 0, cleanNtn || null, cleanStrn || null]
     );
-    res.status(201).json({ id: result.insertId, ...req.body, is_licensed: is_licensed ? 1 : 0 });
+    res.status(201).json({ id: result.insertId, ...req.body, ntn: cleanNtn || null, strn: cleanStrn || null, is_licensed: is_licensed ? 1 : 0 });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { name, address, phone, license_no, license_expiry, city_id, area_id, territory_id, is_licensed } = req.body;
+    const { name, address, phone, license_no, license_expiry, city_id, area_id, territory_id, is_licensed, ntn, strn } = req.body;
 
     const isDuplicate = await findDuplicateCustomer(db, { name, city_id, area_id, territory_id }, req.params.id);
     if (isDuplicate) {
       return res.status(409).json({ message: 'A customer with this name already exists in the selected City, Area and Territory.' });
     }
 
+    // Same digit-only defence as POST — the UI already sends clean
+    // digits, this catches manual API callers / older clients.
+    const cleanNtn  = ntn  ? String(ntn).replace(/\D/g, '')  : null;
+    const cleanStrn = strn ? String(strn).replace(/\D/g, '') : null;
+
     await db.query(
-      'UPDATE customers SET name=?, address=?, phone=?, license_no=?, license_expiry=?, city_id=?, area_id=?, territory_id=?, is_licensed=? WHERE id=?',
-      [name, address, phone, license_no || null, license_expiry || null, city_id || null, area_id || null, territory_id || null, is_licensed ? 1 : 0, req.params.id]
+      'UPDATE customers SET name=?, address=?, phone=?, license_no=?, license_expiry=?, city_id=?, area_id=?, territory_id=?, is_licensed=?, ntn=?, strn=? WHERE id=?',
+      [name, address, phone, license_no || null, license_expiry || null, city_id || null, area_id || null, territory_id || null, is_licensed ? 1 : 0, cleanNtn || null, cleanStrn || null, req.params.id]
     );
     res.json({ message: 'Updated successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
