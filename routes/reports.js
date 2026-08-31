@@ -252,11 +252,11 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
   {
     const balStr = `${Math.abs(runningBalance).toFixed(2)} ${runningBalance >= 0 ? 'Dr' : 'Cr'}`;
     doc.font('Helvetica-Bold').fontSize(TABLE_FONT_SIZE).fillColor('#000');
-    doc.text('â€”',               cols.date.x,    y + TABLE_TOP_PAD, { width: cols.date.w,        lineBreak: false });
-    doc.text('â€”',               cols.invoice.x, y + TABLE_TOP_PAD, { width: cols.invoice.w,     lineBreak: false });
+    doc.text('-',               cols.date.x,    y + TABLE_TOP_PAD, { width: cols.date.w,        lineBreak: false });
+    doc.text('-',               cols.invoice.x, y + TABLE_TOP_PAD, { width: cols.invoice.w,     lineBreak: false });
     doc.text('Opening Balance', cols.desc.x,    y + TABLE_TOP_PAD, { width: cols.desc.w,        lineBreak: false });
-    doc.text('â€”',               cols.dr.x,      y + TABLE_TOP_PAD, { width: cols.dr.w - 4,      align: 'right', lineBreak: false });
-    doc.text('â€”',               cols.cr.x,      y + TABLE_TOP_PAD, { width: cols.cr.w - 4,      align: 'right', lineBreak: false });
+    doc.text('-',               cols.dr.x,      y + TABLE_TOP_PAD, { width: cols.dr.w - 4,      align: 'right', lineBreak: false });
+    doc.text('-',               cols.cr.x,      y + TABLE_TOP_PAD, { width: cols.cr.w - 4,      align: 'right', lineBreak: false });
     doc.text(balStr,            cols.balance.x, y + TABLE_TOP_PAD, { width: cols.balance.w - 4, align: 'right', lineBreak: false });
     y += TABLE_MIN_ROW;
   }
@@ -271,10 +271,10 @@ function generateLedgerPDF(res, { type, entity, ledger, openingBalance, from_dat
     totalCr += cr;
 
     const dateStr    = formatDatePKT(row.date);
-    const invoiceStr = row.invoice_no  || 'â€”';
-    const descStr    = row.description || 'â€”';
-    const drStr      = dr > 0 ? dr.toFixed(2) : 'â€”';
-    const crStr      = cr > 0 ? cr.toFixed(2) : 'â€”';
+    const invoiceStr = row.invoice_no  || '-';
+    const descStr    = row.description || '-';
+    const drStr      = dr > 0 ? dr.toFixed(2) : '-';
+    const crStr      = cr > 0 ? cr.toFixed(2) : '-';
     const balStr     = `${Math.abs(runningBalance).toFixed(2)} ${runningBalance >= 0 ? 'Dr' : 'Cr'}`;
 
     // Set font before measuring so heightOfString uses the exact same metrics
@@ -572,13 +572,13 @@ function generateSalesReportPDF(res, { rows, from_date, to_date, salesmanLabel, 
 
     const srStr      = String(i + 1);
     const dateStr    = formatDatePKT(row.date);
-    const invoiceStr = row.invoice_no    || 'â€”';
-    const custStr    = row.customer_name || 'â€”';
+    const invoiceStr = row.invoice_no    || '-';
+    const custStr    = row.customer_name || '-';
     const grossStr   = gross.toFixed(2);
-    const discStr    = disc > 0 ? disc.toFixed(2) : 'â€”';
-    const retStr     = ret  > 0 ? ret.toFixed(2)  : 'â€”';
+    const discStr    = disc > 0 ? disc.toFixed(2) : '-';
+    const retStr     = ret  > 0 ? ret.toFixed(2)  : '-';
     const netStr     = net.toFixed(2);
-    const recStr     = rec  > 0 ? rec.toFixed(2)  : 'â€”';
+    const recStr     = rec  > 0 ? rec.toFixed(2)  : '-';
 
     // Must set font before measuring
     doc.font('Helvetica').fontSize(TABLE_FONT_SIZE);
@@ -685,11 +685,11 @@ function generateRecoveryReportPDF(res, { rows, from_date, to_date, supplierLabe
 
     const srStr      = String(i + 1);
     const dateStr    = formatDatePKT(row.date);
-    const invoiceStr = row.invoice_no || 'â€”';
-    const custStr    = row.customer_name || 'â€”';
+    const invoiceStr = row.invoice_no || '-';
+    const custStr    = row.customer_name || '-';
     const grossStr   = gross.toFixed(2);
-    const discStr    = disc > 0 ? disc.toFixed(2) : 'â€”';
-    const retStr     = ret  > 0 ? ret.toFixed(2)  : 'â€”';
+    const discStr    = disc > 0 ? disc.toFixed(2) : '-';
+    const retStr     = ret  > 0 ? ret.toFixed(2)  : '-';
     const recStr     = rec.toFixed(2);
     const pendingStr = pending.toFixed(2);
 
