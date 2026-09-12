@@ -71,9 +71,18 @@ app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {
     const [top_products] = await db.query(`
       SELECT p.name,
              SUM(si.qty) AS total_qty,
-             SUM(si.qty * (si.sale_rate - si.purchase_rate_snapshot)) AS gross_profit
+             SUM(
+               si.total - si.recovery_discount - COALESCE(ret.ret_amt, 0)
+               - (COALESCE(si.qty, 0) + COALESCE(si.bonus, 0) - COALESCE(si.returned_qty, 0))
+                 * COALESCE(si.purchase_rate_snapshot, 0)
+             ) AS gross_profit
         FROM sale_items si
         JOIN products p ON si.product_id = p.id
+        LEFT JOIN (
+          SELECT sale_item_id, SUM(COALESCE(return_amount, 0)) AS ret_amt
+            FROM return_items
+           GROUP BY sale_item_id
+        ) ret ON ret.sale_item_id = si.id
        GROUP BY p.id, p.name
        ORDER BY total_qty DESC
        LIMIT 5
