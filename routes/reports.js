@@ -2021,7 +2021,7 @@ function generateBatchActivityPDF(res, {
   doc.end();
 }
 
-// ─── Product Sales Report data ─────────────────────────────────────────────
+// ─── Profit Report data ────────────────────────────────────────────────────
 //
 // One row per product with any sales activity in the window. Aggregates
 // at product grain (not company / not batch), so a product sold across
@@ -2050,7 +2050,13 @@ function generateBatchActivityPDF(res, {
 //                        − SUM(return_items.return_amount)
 //                        Matches the Sale Summary report's "Net" column.
 //                        Billed revenue view — independent of whether
-//                        cash was collected.
+//                        cash was collected. MUST stay accrual-basis:
+//                        pairing this with an accrual COGS below and a
+//                        cash-basis revenue (si.recovered_amount) is what
+//                        caused the false "loss" bug fixed 2026-09 — any
+//                        company with outstanding receivables would show
+//                        an understated/negative profit. Do not swap this
+//                        back to si.recovered_amount.
 //
 //   COGS               = SUM((si.qty + si.bonus − si.returned_qty)
 //                            × si.purchase_rate_snapshot)
@@ -2067,7 +2073,7 @@ function generateBatchActivityPDF(res, {
 // silently paper over it. The frontend can optionally flag them; the
 // backend just returns the honest number.
 
-async function fetchProductSalesData({ from_date, to_date, group_by = 'company', entity_ids = [] }) {
+async function fetchProfitReportData({ from_date, to_date, group_by = 'company', entity_ids = [] }) {
   if (!from_date || !to_date) {
     const err = new Error('from_date and to_date are required');
     err.status = 400;
@@ -2090,10 +2096,19 @@ async function fetchProductSalesData({ from_date, to_date, group_by = 'company',
       ${groupIdExpr}                                             AS group_id,
       ${groupNameExpr}                                           AS group_name,
 
-      /* Revenue here means actual collected cash, excluding discount/returns.
-         We use line-level recovered_amount cumulatives maintained by
-         recoveries reproration. */
-      SUM(COALESCE(si.recovered_amount, 0))                      AS revenue,
+      /* Net Revenue = billed total, net of recovery discount and returns.
+         Matches the Sale Summary report's "Net" column (see fetchSaleSummaryData) —
+         an accrual view, independent of whether cash has actually been
+         collected yet. This is what the header comment always specified;
+         it must stay accrual-basis so it lines up with COGS below, which
+         is also accrual (costs every unit that left the shelf, not just
+         units that have been paid for). Mixing a cash-collected revenue
+         figure with accrual COGS understates profit for any company with
+         outstanding receivables — do not swap this back to
+         si.recovered_amount. */
+      SUM(
+        si.total - si.recovery_discount - COALESCE(ret.ret_amt, 0)
+      )                                                          AS revenue,
 
       /* COGS: frozen snapshot × units ultimately kept off the shelf
          (paid + bonus − returned). Lines with NULL snapshot contribute 0
@@ -2111,6 +2126,11 @@ async function fetchProductSalesData({ from_date, to_date, group_by = 'company',
     JOIN products   p    ON p.id = si.product_id
     LEFT JOIN companies co ON co.id = p.company_id
     LEFT JOIN employees e_sm ON e_sm.id = s.salesman_id
+    LEFT JOIN (
+      SELECT sale_item_id, SUM(COALESCE(return_amount, 0)) AS ret_amt
+        FROM return_items
+       GROUP BY sale_item_id
+    ) ret ON ret.sale_item_id = si.id
     WHERE s.date BETWEEN ? AND ?
   `;
   if (entity_ids.length) {
@@ -2145,10 +2165,10 @@ async function fetchProductSalesData({ from_date, to_date, group_by = 'company',
   });
 }
 
-router.get('/product-sales', auth, async (req, res) => {
+router.get('/profit-report', auth, async (req, res) => {
   try {
     const { from_date, to_date, group_by, entity_ids } = req.query;
-    const rows = await fetchProductSalesData({
+    const rows = await fetchProfitReportData({
       from_date,
       to_date,
       group_by: group_by || 'company',
@@ -2160,12 +2180,12 @@ router.get('/product-sales', auth, async (req, res) => {
   }
 });
 
-router.get('/product-sales/pdf', auth, async (req, res) => {
+router.get('/profit-report/pdf', auth, async (req, res) => {
   try {
     const { from_date, to_date, group_by, entity_ids } = req.query;
     const groupBy = group_by || 'company';
     const ids = parseCsvIds(entity_ids);
-    const rows = await fetchProductSalesData({
+    const rows = await fetchProfitReportData({
       from_date,
       to_date,
       group_by: groupBy,
@@ -2190,7 +2210,7 @@ router.get('/product-sales/pdf', auth, async (req, res) => {
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="profit-report.pdf"');
-    generateProductSalesPDF(res, {
+    generateProfitReportPDF(res, {
       rows,
       from_date,
       to_date,
@@ -2203,7 +2223,7 @@ router.get('/product-sales/pdf', auth, async (req, res) => {
   }
 });
 
-// ─── generateProductSalesPDF ───────────────────────────────────────────────
+// ─── generateProfitReportPDF ────────────────────────────────────────────────
 //
 // Mirrors generateSalesReportPDF's structure: same header + filter box,
 // same buildPdfColumns / TABLE_* typography, same TOTAL row layout.
@@ -2213,7 +2233,7 @@ router.get('/product-sales/pdf', auth, async (req, res) => {
 //   - Pack is narrow (short strings, rare to overflow).
 //   - Money columns get slightly more room than qty columns because they
 //     can hit 6+ digits with a decimal.
-function generateProductSalesPDF(res, { rows, from_date, to_date, groupBy, selectedLabel, company }) {
+function generateProfitReportPDF(res, { rows, from_date, to_date, groupBy, selectedLabel, company }) {
   const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
   doc.pipe(res);
 
@@ -2304,6 +2324,5 @@ function generateProductSalesPDF(res, { rows, from_date, to_date, groupBy, selec
   doc.flushPages();
   doc.end();
 }
-
 
 module.exports = router;
