@@ -789,13 +789,22 @@ const SALE_SUMMARY_VALUE_COLUMNS = {
 
 const SALE_SUMMARY_DEFAULT_VALUE_COLUMNS = ['net_qty', 'gross', 'disc', 'ret', 'net', 'rec'];
 
-function parseCsvIds(v) {
+// group_by: 'numeric' (default) validates against integer PKs — used for
+// salesman_ids / customer_ids / product_ids, all INT AUTO_INCREMENT.
+// group_by: 'company' validates against companies.id's format instead —
+// VARCHAR(20) alphanumeric codes like 'MVC-0002', not integers. Passing
+// company codes through the numeric-only path throws "Invalid id in
+// filter list" for every legitimate company id — that was the bug fixed
+// 2026-09 for Sale Summary's company_ids and the Profit report's
+// entity_ids (when group_by=company).
+function parseCsvIds(v, idKind = 'numeric') {
   if (!v) return [];
   const raw = String(v).split(',').map(s => s.trim()).filter(Boolean);
+  const pattern = idKind === 'company' ? /^[A-Za-z0-9_-]{1,20}$/ : /^\d+$/;
   const uniq = [];
   const seen = new Set();
   for (const it of raw) {
-    if (!/^\d+$/.test(it)) throw new Error(`Invalid id in filter list: ${it}`);
+    if (!pattern.test(it)) throw new Error(`Invalid id in filter list: ${it}`);
     if (seen.has(it)) continue;
     seen.add(it);
     uniq.push(it);
@@ -923,7 +932,7 @@ router.get('/sale-summary', auth, async (req, res) => {
     const filters = {
       salesman_ids: parseCsvIds(salesman_ids),
       customer_ids: parseCsvIds(customer_ids),
-      company_ids: parseCsvIds(company_ids),
+      company_ids: parseCsvIds(company_ids, 'company'),
       product_ids: parseCsvIds(product_ids),
     };
     const rows = await fetchSaleSummaryData({ from_date, to_date, layers, filters });
@@ -957,7 +966,7 @@ router.get('/sale-summary/pdf', auth, async (req, res) => {
     const filters = {
       salesman_ids: parseCsvIds(salesman_ids),
       customer_ids: parseCsvIds(customer_ids),
-      company_ids: parseCsvIds(company_ids),
+      company_ids: parseCsvIds(company_ids, 'company'),
       product_ids: parseCsvIds(product_ids),
     };
     const rows = await fetchSaleSummaryData({ from_date, to_date, layers, filters });
@@ -2021,7 +2030,7 @@ function generateBatchActivityPDF(res, {
   doc.end();
 }
 
-// ─── Profit Report data ────────────────────────────────────────────────────
+// ─── Product Sales Report data ─────────────────────────────────────────────
 //
 // One row per product with any sales activity in the window. Aggregates
 // at product grain (not company / not batch), so a product sold across
@@ -2050,13 +2059,7 @@ function generateBatchActivityPDF(res, {
 //                        − SUM(return_items.return_amount)
 //                        Matches the Sale Summary report's "Net" column.
 //                        Billed revenue view — independent of whether
-//                        cash was collected. MUST stay accrual-basis:
-//                        pairing this with an accrual COGS below and a
-//                        cash-basis revenue (si.recovered_amount) is what
-//                        caused the false "loss" bug fixed 2026-09 — any
-//                        company with outstanding receivables would show
-//                        an understated/negative profit. Do not swap this
-//                        back to si.recovered_amount.
+//                        cash was collected.
 //
 //   COGS               = SUM((si.qty + si.bonus − si.returned_qty)
 //                            × si.purchase_rate_snapshot)
@@ -2073,7 +2076,7 @@ function generateBatchActivityPDF(res, {
 // silently paper over it. The frontend can optionally flag them; the
 // backend just returns the honest number.
 
-async function fetchProfitReportData({ from_date, to_date, group_by = 'company', entity_ids = [] }) {
+async function fetchProductSalesData({ from_date, to_date, group_by = 'company', entity_ids = [] }) {
   if (!from_date || !to_date) {
     const err = new Error('from_date and to_date are required');
     err.status = 400;
@@ -2165,14 +2168,15 @@ async function fetchProfitReportData({ from_date, to_date, group_by = 'company',
   });
 }
 
-router.get('/profit-report', auth, async (req, res) => {
+router.get('/product-sales', auth, async (req, res) => {
   try {
     const { from_date, to_date, group_by, entity_ids } = req.query;
-    const rows = await fetchProfitReportData({
+    const groupBy = group_by || 'company';
+    const rows = await fetchProductSalesData({
       from_date,
       to_date,
-      group_by: group_by || 'company',
-      entity_ids: parseCsvIds(entity_ids),
+      group_by: groupBy,
+      entity_ids: parseCsvIds(entity_ids, groupBy === 'company' ? 'company' : 'numeric'),
     });
     res.json({ rows });
   } catch (err) {
@@ -2180,12 +2184,12 @@ router.get('/profit-report', auth, async (req, res) => {
   }
 });
 
-router.get('/profit-report/pdf', auth, async (req, res) => {
+router.get('/product-sales/pdf', auth, async (req, res) => {
   try {
     const { from_date, to_date, group_by, entity_ids } = req.query;
     const groupBy = group_by || 'company';
-    const ids = parseCsvIds(entity_ids);
-    const rows = await fetchProfitReportData({
+    const ids = parseCsvIds(entity_ids, groupBy === 'company' ? 'company' : 'numeric');
+    const rows = await fetchProductSalesData({
       from_date,
       to_date,
       group_by: groupBy,
@@ -2210,7 +2214,7 @@ router.get('/profit-report/pdf', auth, async (req, res) => {
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="profit-report.pdf"');
-    generateProfitReportPDF(res, {
+    generateProductSalesPDF(res, {
       rows,
       from_date,
       to_date,
@@ -2223,7 +2227,7 @@ router.get('/profit-report/pdf', auth, async (req, res) => {
   }
 });
 
-// ─── generateProfitReportPDF ────────────────────────────────────────────────
+// ─── generateProductSalesPDF ───────────────────────────────────────────────
 //
 // Mirrors generateSalesReportPDF's structure: same header + filter box,
 // same buildPdfColumns / TABLE_* typography, same TOTAL row layout.
@@ -2233,7 +2237,7 @@ router.get('/profit-report/pdf', auth, async (req, res) => {
 //   - Pack is narrow (short strings, rare to overflow).
 //   - Money columns get slightly more room than qty columns because they
 //     can hit 6+ digits with a decimal.
-function generateProfitReportPDF(res, { rows, from_date, to_date, groupBy, selectedLabel, company }) {
+function generateProductSalesPDF(res, { rows, from_date, to_date, groupBy, selectedLabel, company }) {
   const doc = new PDFDocument({ margin: 40, size: 'A4', bufferPages: true });
   doc.pipe(res);
 
@@ -2324,5 +2328,6 @@ function generateProfitReportPDF(res, { rows, from_date, to_date, groupBy, selec
   doc.flushPages();
   doc.end();
 }
+
 
 module.exports = router;
