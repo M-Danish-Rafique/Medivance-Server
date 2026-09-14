@@ -11,9 +11,9 @@ async function findDuplicateCustomer(db, { name, city_id, area_id, territory_id 
   let query = `
     SELECT id FROM customers
     WHERE name = ?
-      AND city_id <=> ?
-      AND area_id <=> ?
-      AND territory_id <=> ?
+    AND city_id <=> ?
+    AND area_id <=> ?
+    AND territory_id <=> ?
   `;
   const params = [name, city_id || null, area_id || null, territory_id || null];
   if (excludeId) {
@@ -32,7 +32,7 @@ router.get('/', auth, async (req, res) => {
       LEFT JOIN cities ci ON cu.city_id=ci.id
       LEFT JOIN areas a ON cu.area_id=a.id
       LEFT JOIN territories t ON cu.territory_id=t.id
-      ORDER BY cu.name
+      ORDER BY cu.created_at DESC, cu.id DESC
     `);
     res.json(rows);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -66,7 +66,7 @@ router.post('/', auth, async (req, res) => {
     // presentation-layer TaxIdInput / formatTaxId handles masking on the
     // way in and out. Any stray non-digit that slips through the UI is
     // stripped here as a defence-in-depth safeguard.
-    const cleanNtn  = ntn  ? String(ntn).replace(/\D/g, '')  : null;
+    const cleanNtn = ntn ? String(ntn).replace(/\D/g, '') : null;
     const cleanStrn = strn ? String(strn).replace(/\D/g, '') : null;
 
     const [result] = await db.query(
@@ -88,7 +88,7 @@ router.put('/:id', auth, async (req, res) => {
 
     // Same digit-only defence as POST — the UI already sends clean
     // digits, this catches manual API callers / older clients.
-    const cleanNtn  = ntn  ? String(ntn).replace(/\D/g, '')  : null;
+    const cleanNtn = ntn ? String(ntn).replace(/\D/g, '') : null;
     const cleanStrn = strn ? String(strn).replace(/\D/g, '') : null;
 
     await db.query(
