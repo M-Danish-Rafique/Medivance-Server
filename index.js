@@ -43,6 +43,15 @@ app.use('/api/recoveries', require('./routes/recoveries'));
 app.use('/api/raw-materials', require('./routes/rawMaterials'));
 app.use('/api/manufacturing', require('./routes/manufacturing'));
 app.use('/api/tax-ledger', require('./routes/taxLedger'));
+// Workforce Management (HR & Payroll). These routers enforce their own
+// perm_hr_* flags server-side via middleware/requirePermission, unlike the
+// older modules where the flags are client-side only.
+app.use('/api/departments', require('./routes/departments'));
+app.use('/api/designations', require('./routes/designations'));
+app.use('/api/hr/employees', require('./routes/hrEmployees'));
+app.use('/api/hr/attendance', require('./routes/attendance'));
+app.use('/api/hr/payroll-runs', require('./routes/payrollRuns'));
+app.use('/api/hr/salary-slips', require('./routes/salarySlips'));
 app.use('/api/admin', require('./routes/admin'));
 
 app.get('/api/dashboard', require('./middleware/auth'), async (req, res) => {

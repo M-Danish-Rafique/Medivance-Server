@@ -83,9 +83,40 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
+// Master Data employees are referenced by three columns across two modules.
+// Those FKs are ON DELETE SET NULL, so MySQL would happily delete the row and
+// silently orphan historical invoices and recoveries — the attribution on
+// those documents would just disappear. So the references are checked first
+// and the delete is refused with a message naming the modules involved.
+//
+// hr_employees.master_employee_id is deliberately NOT part of this guard: it
+// is also ON DELETE SET NULL, and an HR profile losing its Master Data link
+// is a recoverable soft-orphan (the profile survives, payroll just can't
+// compute sales-target achievement until it is re-linked).
 router.delete('/:id', auth, async (req, res) => {
   try {
-    await db.query('DELETE FROM employees WHERE id=?', [req.params.id]);
+    const id = req.params.id;
+
+    const [[sales]] = await db.query(
+      'SELECT COUNT(*) AS cnt FROM sales WHERE salesman_id = ? OR delivery_by = ?',
+      [id, id]
+    );
+    const [[recoveries]] = await db.query(
+      'SELECT COUNT(*) AS cnt FROM recoveries WHERE salesman_id = ?',
+      [id]
+    );
+
+    if (sales.cnt > 0 || recoveries.cnt > 0) {
+      const holders = [];
+      if (sales.cnt > 0)      holders.push(`Sale (${sales.cnt} invoice${sales.cnt === 1 ? '' : 's'})`);
+      if (recoveries.cnt > 0) holders.push(`Recovery & Return (${recoveries.cnt} record${recoveries.cnt === 1 ? '' : 's'})`);
+      return res.status(409).json({
+        message: `This employee is still referenced by ${holders.join(' and ')}. Reassign those records to another employee before deleting.`,
+      });
+    }
+
+    const [result] = await db.query('DELETE FROM employees WHERE id=?', [id]);
+    if (result.affectedRows === 0) return res.status(404).json({ message: 'Employee not found' });
     res.json({ message: 'Deleted successfully' });
   } catch (err) {
     res.status(500).json({ message: err.message });

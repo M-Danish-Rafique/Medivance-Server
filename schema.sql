@@ -1,3 +1,11 @@
+-- ----------------------------------------------------------------------------
+-- MySQL Workbench Migration
+-- Migrated Schemata: medivance
+-- Source Schemata: medivance
+-- Created: Sun Sep 20 03:29:34 2026
+-- Workbench Version: 8.0.36
+-- ----------------------------------------------------------------------------
+
 SET FOREIGN_KEY_CHECKS = 0;
 
 -- ----------------------------------------------------------------------------
@@ -43,7 +51,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`audit_logs` (
   INDEX `idx_al_module` (`module` ASC) VISIBLE,
   INDEX `idx_al_created` (`created_at` ASC) VISIBLE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 3177
+AUTO_INCREMENT = 4638
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -86,6 +94,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`company_settings` (
   `phone` VARCHAR(100) NULL DEFAULT NULL,
   `email` VARCHAR(200) NULL DEFAULT NULL,
   `logo_url` VARCHAR(500) NULL DEFAULT NULL,
+  `signature_url` LONGTEXT NULL DEFAULT NULL,
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`))
 ENGINE = InnoDB
@@ -114,7 +123,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`customer_ledger` (
     FOREIGN KEY (`customer_id`)
     REFERENCES `medivance`.`customers` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 1559
+AUTO_INCREMENT = 2374
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -129,6 +138,8 @@ CREATE TABLE IF NOT EXISTS `medivance`.`customers` (
   `license_no` VARCHAR(100) NULL DEFAULT NULL,
   `license_expiry` DATE NULL DEFAULT NULL,
   `is_licensed` TINYINT(1) NOT NULL DEFAULT '0' COMMENT '1 = Licensed (Pharmacy / Medical Store), 0 = Non-Licensed (Mart / General Store / Grocery Store)',
+  `ntn` VARCHAR(20) NULL DEFAULT NULL,
+  `strn` VARCHAR(20) NULL DEFAULT NULL,
   `city_id` INT NULL DEFAULT NULL,
   `area_id` INT NULL DEFAULT NULL,
   `territory_id` INT NULL DEFAULT NULL,
@@ -153,7 +164,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`customers` (
     REFERENCES `medivance`.`territories` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 383
+AUTO_INCREMENT = 445
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -218,7 +229,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`finance` (
     REFERENCES `medivance`.`suppliers` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 8
+AUTO_INCREMENT = 11
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -244,7 +255,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`inventory` (
     REFERENCES `medivance`.`products` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 154
+AUTO_INCREMENT = 176
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -271,7 +282,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`inventory_movements` (
     REFERENCES `medivance`.`products` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 2615
+AUTO_INCREMENT = 3614
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -468,7 +479,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`products` (
     REFERENCES `medivance`.`units_of_measurement` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 112
+AUTO_INCREMENT = 114
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -501,7 +512,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`purchase_items` (
     REFERENCES `medivance`.`purchases` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 113
+AUTO_INCREMENT = 142
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -523,7 +534,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`purchases` (
     FOREIGN KEY (`supplier_id`)
     REFERENCES `medivance`.`suppliers` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 9
+AUTO_INCREMENT = 13
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -583,7 +594,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`recoveries` (
     REFERENCES `medivance`.`employees` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 742
+AUTO_INCREMENT = 1046
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -614,7 +625,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`recovery_items` (
     FOREIGN KEY (`sale_item_id`)
     REFERENCES `medivance`.`sale_items` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 40
+AUTO_INCREMENT = 76
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -650,7 +661,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`return_items` (
     FOREIGN KEY (`sale_item_id`)
     REFERENCES `medivance`.`sale_items` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 227
+AUTO_INCREMENT = 311
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -735,7 +746,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`sale_items` (
     REFERENCES `medivance`.`sales` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 1621
+AUTO_INCREMENT = 2512
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -779,7 +790,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`sales` (
     REFERENCES `medivance`.`employees` (`id`)
     ON DELETE SET NULL)
 ENGINE = InnoDB
-AUTO_INCREMENT = 756
+AUTO_INCREMENT = 1148
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -826,7 +837,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`supplier_ledger` (
     FOREIGN KEY (`supplier_id`)
     REFERENCES `medivance`.`suppliers` (`id`))
 ENGINE = InnoDB
-AUTO_INCREMENT = 22
+AUTO_INCREMENT = 29
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 
@@ -916,7 +927,7 @@ CREATE TABLE IF NOT EXISTS `medivance`.`territories` (
     REFERENCES `medivance`.`areas` (`id`)
     ON DELETE CASCADE)
 ENGINE = InnoDB
-AUTO_INCREMENT = 120
+AUTO_INCREMENT = 124
 DEFAULT CHARACTER SET = utf8mb4
 COLLATE = utf8mb4_0900_ai_ci;
 

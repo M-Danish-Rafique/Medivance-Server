@@ -59,7 +59,8 @@ router.get('/users', auth, adminOnly, async (req, res) => {
              up.perm_customers, up.perm_suppliers,
              up.perm_purchase, up.perm_view_purchase_rate, up.perm_sale, up.perm_inventory, up.perm_recovery,
              up.perm_mfg_products, up.perm_mfg_raw_materials, up.perm_mfg_batches, up.perm_mfg_yields,
-             up.perm_finance, up.perm_reports, up.perm_tax_ledger
+             up.perm_finance, up.perm_reports, up.perm_tax_ledger,
+             up.perm_hr_employees, up.perm_hr_attendance, up.perm_hr_payroll
       FROM users u
       LEFT JOIN user_permissions up ON u.id = up.user_id
       ORDER BY u.id ASC
@@ -91,8 +92,9 @@ router.post('/users', auth, adminOnly, async (req, res) => {
          perm_companies, perm_products, perm_employees, perm_geography, perm_customers, perm_suppliers,
          perm_purchase, perm_view_purchase_rate, perm_sale, perm_inventory, perm_recovery,
          perm_mfg_products, perm_mfg_raw_materials, perm_mfg_batches, perm_mfg_yields,
-         perm_finance, perm_reports, perm_tax_ledger)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         perm_finance, perm_reports, perm_tax_ledger,
+         perm_hr_employees, perm_hr_attendance, perm_hr_payroll)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [userId,
         permissions.perm_companies ? 1 : 0, permissions.perm_products ? 1 : 0,
         permissions.perm_employees ? 1 : 0, permissions.perm_geography ? 1 : 0,
@@ -102,7 +104,9 @@ router.post('/users', auth, adminOnly, async (req, res) => {
         permissions.perm_mfg_products ? 1 : 0, permissions.perm_mfg_raw_materials ? 1 : 0,
         permissions.perm_mfg_batches ? 1 : 0, permissions.perm_mfg_yields ? 1 : 0,
         permissions.perm_finance ? 1 : 0, permissions.perm_reports ? 1 : 0,
-        permissions.perm_tax_ledger ? 1 : 0
+        permissions.perm_tax_ledger ? 1 : 0,
+        permissions.perm_hr_employees ? 1 : 0, permissions.perm_hr_attendance ? 1 : 0,
+        permissions.perm_hr_payroll ? 1 : 0
       ]
     );
 
@@ -143,8 +147,9 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
          perm_companies, perm_products, perm_employees, perm_geography, perm_customers, perm_suppliers,
          perm_purchase, perm_view_purchase_rate, perm_sale, perm_inventory, perm_recovery,
          perm_mfg_products, perm_mfg_raw_materials, perm_mfg_batches, perm_mfg_yields,
-         perm_finance, perm_reports, perm_tax_ledger)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         perm_finance, perm_reports, perm_tax_ledger,
+         perm_hr_employees, perm_hr_attendance, perm_hr_payroll)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON DUPLICATE KEY UPDATE
          perm_companies=VALUES(perm_companies), perm_products=VALUES(perm_products),
          perm_employees=VALUES(perm_employees), perm_geography=VALUES(perm_geography),
@@ -154,7 +159,9 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
          perm_mfg_products=VALUES(perm_mfg_products), perm_mfg_raw_materials=VALUES(perm_mfg_raw_materials),
          perm_mfg_batches=VALUES(perm_mfg_batches), perm_mfg_yields=VALUES(perm_mfg_yields),
          perm_finance=VALUES(perm_finance), perm_reports=VALUES(perm_reports),
-         perm_tax_ledger=VALUES(perm_tax_ledger)`,
+         perm_tax_ledger=VALUES(perm_tax_ledger),
+         perm_hr_employees=VALUES(perm_hr_employees), perm_hr_attendance=VALUES(perm_hr_attendance),
+         perm_hr_payroll=VALUES(perm_hr_payroll)`,
       [uid,
         permissions.perm_companies ? 1 : 0, permissions.perm_products ? 1 : 0,
         permissions.perm_employees ? 1 : 0, permissions.perm_geography ? 1 : 0,
@@ -164,7 +171,9 @@ router.put('/users/:id', auth, adminOnly, async (req, res) => {
         permissions.perm_mfg_products ? 1 : 0, permissions.perm_mfg_raw_materials ? 1 : 0,
         permissions.perm_mfg_batches ? 1 : 0, permissions.perm_mfg_yields ? 1 : 0,
         permissions.perm_finance ? 1 : 0, permissions.perm_reports ? 1 : 0,
-        permissions.perm_tax_ledger ? 1 : 0
+        permissions.perm_tax_ledger ? 1 : 0,
+        permissions.perm_hr_employees ? 1 : 0, permissions.perm_hr_attendance ? 1 : 0,
+        permissions.perm_hr_payroll ? 1 : 0
       ]
     );
 
