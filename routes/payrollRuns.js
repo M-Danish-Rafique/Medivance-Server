@@ -24,9 +24,14 @@ const { loadPendingEmployees, countEligibleEmployees } = require('../utils/payro
 // Cost to Company is ONE figure per month, recorded on the run when it is
 // closed (payroll_runs.cost_to_company, migration add_payroll_ctc.sql). The
 // close request may carry the operator's figure; without one the calculated
-// figure — total gross earnings of the run's payslips — is stored. Deductions
-// never reduce it (tax is still the company's money; a loan recovery settles
-// money already lent). NULL = not recorded (open, or closed before the column).
+// figure is stored: gross earnings less deductions, EXCLUDING loan repayments
+// (they settle money already lent) and never reduced by advance salary (the
+// same salary, paid earlier) — product decision 2026-10-01, which replaced the
+// earlier "CTC = gross" rule. NULL = not recorded (open, or closed before the
+// column).
+//
+// `total_net` below is the sum of salary_slips.net_pay, i.e. net PAYABLE —
+// the cash still to disburse after each month's advances.
 //
 // A run can only be closed once EVERY employee payable in its month has a
 // slip. Someone who should not be paid gets a zero-pay slip stating why, so
@@ -179,12 +184,22 @@ router.put('/:id/complete', auth, perm, async (req, res) => {
       });
     }
 
-    // Monthly Cost to Company. Calculated from the slips' own gross earnings
-    // (read under the run's exclusive lock, so the slip set cannot change);
-    // the operator's figure replaces it when one is sent.
-    const [slipRows] = await conn.query('SELECT earnings_json FROM salary_slips WHERE month = ?', [run.month]);
+    // Monthly Cost to Company, calculated from the slips' own snapshots (read
+    // under the run's exclusive lock, so the slip set cannot change): gross
+    // earnings less deductions, EXCLUDING loan repayments (lines tagged with a
+    // loan_id — they return money lent earlier) and never reduced by advance
+    // salary (the same salary, paid early). Product decision 2026-10-01;
+    // mirrored by monthTotals.ctc in SalarySlips.jsx. The operator's figure
+    // replaces it when one is sent.
+    const [slipRows] = await conn.query(
+      'SELECT earnings_json, deductions_json FROM salary_slips WHERE month = ?',
+      [run.month]
+    );
+    const lineSum = (lines) => lines.reduce((t, line) => t + (parseFloat(line.amount) || 0), 0);
     const calculatedCtc = money(slipRows.reduce((total, row) => (
-      total + parseJsonColumn(row.earnings_json).reduce((t, line) => t + (parseFloat(line.amount) || 0), 0)
+      total
+        + lineSum(parseJsonColumn(row.earnings_json))
+        - lineSum(parseJsonColumn(row.deductions_json).filter(line => !line.loan_id))
     ), 0));
 
     let costToCompany = calculatedCtc;

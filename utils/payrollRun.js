@@ -79,11 +79,20 @@ async function loadPendingEmployees(conn, month) {
            des.name AS designation_name,
            COALESCE(sc.gross, 0)      AS structure_earnings,
            COALESCE(sc.deductions, 0) AS structure_deductions,
-           COALESCE(lo.outstanding, 0) AS loan_outstanding
+           COALESCE(lo.outstanding, 0) AS loan_outstanding,
+           COALESCE(adv.total, 0)      AS advance_amount
       FROM hr_employees e
       JOIN departments  dep ON dep.id = e.department_id
       JOIN designations des ON des.id = e.designation_id
       LEFT JOIN salary_slips s ON s.employee_id = e.id AND s.month = ?
+      -- The month's advance salary: deducted in full on the payslip, so the
+      -- Pending tab's estimate has to subtract it (utils/salaryAdvances.js).
+      LEFT JOIN (
+        SELECT employee_id, SUM(amount) AS total
+          FROM salary_advances
+         WHERE month = ?
+         GROUP BY employee_id
+      ) adv ON adv.employee_id = e.id
       LEFT JOIN (
         SELECT employee_id,
                SUM(CASE WHEN type = 'Earning'   THEN amount ELSE 0 END) AS gross,
@@ -101,7 +110,7 @@ async function loadPendingEmployees(conn, month) {
      WHERE ${ELIGIBLE_WHERE}
        AND s.id IS NULL
      ORDER BY dep.name, e.name
-  `, [month, last, first]);
+  `, [month, month, last, first]);
   return rows;
 }
 

@@ -5,6 +5,9 @@ const auth    = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
 const requirePermission = require('../middleware/requirePermission');
 const { todayPKT, addMonthsPKT } = require('../utils/dateUtils');
+const {
+  PAISA, fmtPKR, monthLabel, loadAdvanceContext, syncSlipAdvance,
+} = require('../utils/salaryAdvances');
 
 // ─── HR employee profiles ──────────────────────────────────────────────────
 // Separate from Master Data `employees`, which stays exactly as-is: it is
@@ -361,19 +364,37 @@ router.get('/:id', auth, perm, async (req, res) => {
     `, [id]);
 
     const [slipRows] = await db.query(
-      `SELECT id, month, earnings_json, deductions_json, net_pay, generated_at
+      `SELECT id, month, earnings_json, deductions_json, advance_amount, net_pay, generated_at
          FROM salary_slips
         WHERE employee_id=?
         ORDER BY month DESC`,
       [id]
     );
-    // The JSON sides themselves are not returned: the profile shows the two
+    // The JSON sides themselves are not returned: the profile shows the
     // totals, and the full breakdown belongs to the payslip document.
+    // net_pay is the net PAYABLE (net salary less the month's advance).
     const slips = slipRows.map(({ earnings_json, deductions_json, ...slip }) => ({
       ...slip,
+      advance_amount:   money(slip.advance_amount),
       total_earnings:   sumSlipLines(earnings_json),
       total_deductions: sumSlipLines(deductions_json),
     }));
+
+    // Every advance ever recorded, newest pay period first. `locked` = its
+    // month's Pay Run is closed, so it can no longer be removed.
+    const [advanceRows] = await db.query(`
+      SELECT a.id, a.month, a.amount, a.note, a.created_at,
+             DATE_FORMAT(a.date_given, '%Y-%m-%d') AS date_given,
+             u.full_name AS created_by_name,
+             r.status    AS run_status,
+             s.id        AS slip_id
+        FROM salary_advances a
+        LEFT JOIN users         u ON u.id = a.created_by
+        LEFT JOIN payroll_runs  r ON r.month = a.month
+        LEFT JOIN salary_slips  s ON s.employee_id = a.employee_id AND s.month = a.month
+       WHERE a.employee_id = ?
+       ORDER BY a.month DESC, a.date_given DESC, a.id DESC
+    `, [id]);
 
     res.json({
       ...employee,
@@ -381,6 +402,11 @@ router.get('/:id', auth, perm, async (req, res) => {
       sales_target: target ? money(target.target_amount) : null,
       sales_target_updated_at: target ? target.updated_at : null,
       loans,
+      advances: advanceRows.map(row => ({
+        ...row,
+        amount: money(row.amount),
+        locked: row.run_status === 'Completed',
+      })),
       salary_slips: slips,
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -643,7 +669,10 @@ router.put('/:id/salary-components', auth, perm, async (req, res) => {
   }
 });
 
-// ── POST /:id/loans — issue a loan / advance ────────────────────────────────
+// ── POST /:id/loans — issue a loan ──────────────────────────────────────────
+// Advance salary is NOT a loan and has its own routes below: a loan is repaid
+// in instalments the operator chooses, an advance is always deducted in full
+// from one month's payslip.
 router.post('/:id/loans', auth, perm, async (req, res) => {
   try {
     const id = req.params.id;
@@ -651,7 +680,7 @@ router.post('/:id/loans', auth, perm, async (req, res) => {
     if (!employee) return res.status(404).json({ message: 'Employee not found' });
 
     const title = nullableText(req.body.title);
-    if (!title) return res.status(400).json({ field: 'title', message: 'Give the loan a title, e.g. "Eid advance"' });
+    if (!title) return res.status(400).json({ field: 'title', message: 'Enter a reference for the loan.' });
 
     const principal = money(req.body.principal_amount);
     if (!Number.isFinite(principal) || principal <= 0) {
@@ -680,6 +709,195 @@ router.post('/:id/loans', auth, perm, async (req, res) => {
       remaining_balance: principal,
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Advance salary ─────────────────────────────────────────────────────────
+// Rules live in utils/salaryAdvances.js. In short: an advance is recorded
+// against the current month (the next one once the current month's Pay Run is
+// closed); that month's payslip deducts all of it; it can be removed only
+// while that Pay Run is not closed; and net payable never goes below zero.
+
+// GET /:id/advances/context — what the "Record advance" form needs: the pay
+// period the advance will land in, the salary structure it is judged against,
+// what is already advanced that month, and the payslip it would update.
+// Read-only; POST re-derives all of it under lock.
+router.get('/:id/advances/context', auth, perm, async (req, res) => {
+  try {
+    const context = await loadAdvanceContext(db, req.params.id);
+    if (context.error) return res.status(context.error.status).json(context.error.body);
+    const { employee, ...rest } = context;
+    res.json(rest);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// POST /:id/advances {amount, date_given?, note?}
+//   warns (never blocks) when the month's advances exceed the structure's net
+//   (earnings - deductions); blocks when they exceed its gross, because no
+//   payslip could then recover them; with a payslip already processed in an
+//   open run, updates that payslip and blocks if its net payable would go
+//   negative.
+router.post('/:id/advances', auth, perm, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const context = await loadAdvanceContext(conn, req.params.id, { lock: true });
+    if (context.error) {
+      await conn.rollback();
+      return res.status(context.error.status).json(context.error.body);
+    }
+    const { employee, month } = context;
+    if (context.blocked) {
+      await conn.rollback();
+      return res.status(400).json({ field: 'amount', message: context.blocked });
+    }
+
+    const amount = money(req.body.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      await conn.rollback();
+      return res.status(400).json({ field: 'amount', message: 'Enter an amount greater than zero.' });
+    }
+    if (amount > 9999999999.99) {
+      await conn.rollback();
+      return res.status(400).json({ field: 'amount', message: 'The amount is too large.' });
+    }
+
+    const dateGiven = nullableDate(req.body.date_given) || todayPKT();
+    if (!isValidDateString(dateGiven)) {
+      await conn.rollback();
+      return res.status(400).json({ field: 'date_given', message: 'Enter a valid date.' });
+    }
+    if (dateGiven > todayPKT()) {
+      await conn.rollback();
+      return res.status(400).json({ field: 'date_given', message: 'The date cannot be in the future.' });
+    }
+
+    const note = nullableText(req.body.note);
+    if (note && note.length > 200) {
+      await conn.rollback();
+      return res.status(400).json({ field: 'note', message: 'The note must be 200 characters or fewer.' });
+    }
+
+    const monthTotal = money(context.month_total + amount);
+
+    // Without a payslip yet, the live structure is the only yardstick. Above
+    // its gross the advance could never be taken from one payslip, and the
+    // month's Pay Run could then never close. (With a payslip, the stricter
+    // net-payable check in syncSlipAdvance applies instead.)
+    if (!context.slip) {
+      if (context.structure.gross <= 0) {
+        await conn.rollback();
+        return res.status(400).json({
+          field: 'amount',
+          message: `${employee.name} has no salary structure. Set up their earnings under Compensation before recording advance salary.`,
+        });
+      }
+      if (monthTotal - context.structure.gross > PAISA) {
+        await conn.rollback();
+        return res.status(400).json({
+          field: 'amount',
+          message: `Total advances for ${monthLabel(month)} would be ${fmtPKR(monthTotal)}, which exceeds the gross monthly salary of ${fmtPKR(context.structure.gross)}. Reduce the amount or record the balance as a loan.`,
+        });
+      }
+    }
+
+    const [result] = await conn.query(
+      'INSERT INTO salary_advances (employee_id, month, amount, date_given, note, created_by) VALUES (?,?,?,?,?,?)',
+      [employee.id, month, amount, dateGiven, note, req.user.id]
+    );
+
+    const sync = await syncSlipAdvance(conn, employee.id, month);
+    if (sync.error) {
+      await conn.rollback();
+      return res.status(sync.error.status).json(sync.error.body);
+    }
+
+    await conn.commit();
+    await logAudit(req, 'CREATE', 'hr/employees', employee.id,
+      `Advance of ${amount} for ${monthLabel(month)} recorded for ${employee.employee_id} (${employee.name})`
+      + (sync.slip ? ` — payslip net payable ${sync.slip.before.net_pay} -> ${sync.slip.after.net_pay}` : ''));
+
+    res.status(201).json({
+      id: result.insertId,
+      month,
+      amount,
+      date_given: dateGiven,
+      note,
+      month_total: monthTotal,
+      // Informational only — the save went through.
+      exceeds_net_salary: !context.slip && monthTotal - context.structure.net > PAISA,
+      slip_updated: sync.slip,
+    });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// DELETE /:id/advances/:advanceId — correct a mistaken entry. Allowed only
+// while the advance's month is not closed; the payslip (if processed) is
+// updated in the same transaction. Removing an advance only ever raises net
+// payable, so it cannot fail the payslip's own checks.
+router.delete('/:id/advances/:advanceId', auth, perm, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    // Read before the transaction starts, so no plain read fixes its snapshot
+    // ahead of the lock waits (utils/salaryAdvances.js). The row is not
+    // locked here — locking it ahead of the employee row would invert the
+    // lock order — so the DELETE below re-checks it still exists.
+    const [[advance]] = await conn.query(
+      'SELECT id, employee_id, month, amount FROM salary_advances WHERE id = ? AND employee_id = ?',
+      [req.params.advanceId, req.params.id]
+    );
+    if (!advance) {
+      return res.status(404).json({ message: 'This advance salary record was not found.' });
+    }
+
+    await conn.beginTransaction();
+
+    const [[run]] = await conn.query(
+      'SELECT status FROM payroll_runs WHERE month = ? LOCK IN SHARE MODE',
+      [advance.month]
+    );
+    if (run && run.status === 'Completed') {
+      await conn.rollback();
+      return res.status(409).json({
+        code: 'PAYROLL_RUN_COMPLETED',
+        message: `The ${monthLabel(advance.month)} Pay Run is closed. This advance salary is part of a final payslip and cannot be removed.`,
+      });
+    }
+
+    const [[employee]] = await conn.query(
+      'SELECT id, employee_id, name FROM hr_employees WHERE id = ? FOR UPDATE',
+      [advance.employee_id]
+    );
+
+    const [deleted] = await conn.query('DELETE FROM salary_advances WHERE id = ?', [advance.id]);
+    if (deleted.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ message: 'This advance salary has already been removed.' });
+    }
+
+    const sync = await syncSlipAdvance(conn, advance.employee_id, advance.month);
+    if (sync.error) {
+      await conn.rollback();
+      return res.status(sync.error.status).json(sync.error.body);
+    }
+
+    await conn.commit();
+    await logAudit(req, 'DELETE', 'hr/employees', advance.employee_id,
+      `Removed advance of ${money(advance.amount)} for ${monthLabel(advance.month)} from ${employee.employee_id} (${employee.name})`
+      + (sync.slip ? ` — payslip net payable ${sync.slip.before.net_pay} -> ${sync.slip.after.net_pay}` : ''));
+
+    res.json({ message: 'Advance salary removed.', month: advance.month, slip_updated: sync.slip });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ message: err.message });
+  } finally {
+    conn.release();
+  }
 });
 
 // ── PUT /:id/sales-target — set the single live target ──────────────────────

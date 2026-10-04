@@ -31,9 +31,17 @@ async function generateYieldCode() {
   return `YLD-${String(num).padStart(5, '0')}`;
 }
 
-// Convert qty to base unit using UOM factor
+// Convert qty to base unit (g / ml / pcs) using UOM factor. Callers must pass a real
+// factor from units_of_measurement — never default it, a wrong factor mis-costs a batch.
 function toBase(qty, factor) {
-  return parseFloat(qty) * parseFloat(factor || 1);
+  return parseFloat(qty) * parseFloat(factor);
+}
+
+async function getUom(conn, id) {
+  if (!id) return null;
+  const [rows] = await conn.query('SELECT id, symbol, base_type, to_base_factor FROM units_of_measurement WHERE id=?', [id]);
+  const uom = rows[0];
+  return uom && parseFloat(uom.to_base_factor) > 0 ? uom : null;
 }
 
 // ── Product Categories ─────────────────────────────────────
@@ -68,6 +76,7 @@ router.get('/batches', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT b.*, pc.name as category_name, u.symbol as vol_uom_symbol, u.name as vol_uom_name,
+             u.to_base_factor as vol_uom_factor, u.base_type as vol_uom_base_type,
              (SELECT COUNT(*) FROM mfg_yields y WHERE y.batch_id=b.id) as yield_count
       FROM mfg_batches b
       LEFT JOIN product_categories pc ON b.category_id=pc.id
@@ -82,7 +91,7 @@ router.get('/batches/:id', auth, async (req, res) => {
   try {
     const [rows] = await db.query(`
       SELECT b.*, pc.name as category_name, u.name as vol_uom_name, u.symbol as vol_uom_symbol,
-             u.to_base_factor as vol_uom_factor
+             u.to_base_factor as vol_uom_factor, u.base_type as vol_uom_base_type
       FROM mfg_batches b
       LEFT JOIN product_categories pc ON b.category_id=pc.id
       LEFT JOIN units_of_measurement u ON b.volume_uom_id=u.id
@@ -107,23 +116,36 @@ router.post('/batches', auth, async (req, res) => {
   try {
     const { category_id, batch_date, expiry_date, total_volume, volume_uom_id, misc_expense, notes, materials } = req.body;
     if (!batch_date || !expiry_date || !total_volume || !volume_uom_id) {
+      await conn.rollback();
       return res.status(400).json({ message: 'Batch date, expiry date, volume and UOM are required' });
     }
-    if (!materials || !materials.length) return res.status(400).json({ message: 'At least one raw material required' });
-
-    const batch_code = await generateBatchCode(batch_date);
+    if (!(parseFloat(total_volume) > 0)) {
+      await conn.rollback();
+      return res.status(400).json({ message: 'Total volume must be greater than 0' });
+    }
+    if (!materials || !materials.length) {
+      await conn.rollback();
+      return res.status(400).json({ message: 'At least one raw material required' });
+    }
 
     // Get volume UOM factor to convert to base
-    const [uomRows] = await conn.query('SELECT to_base_factor FROM units_of_measurement WHERE id=?', [volume_uom_id]);
-    const volFactor = uomRows[0]?.to_base_factor || 1;
-    const totalVolumeBase = toBase(total_volume, volFactor); // in base unit (ml or g)
+    const volUom = await getUom(conn, volume_uom_id);
+    if (!volUom || volUom.base_type === 'count') {
+      await conn.rollback();
+      return res.status(400).json({ message: 'Batch volume unit must be an existing weight or volume UOM' });
+    }
+    const totalVolumeBase = toBase(total_volume, volUom.to_base_factor); // in base unit (ml or g)
 
     // Validate RM stock availability BEFORE making any changes
     for (const mat of materials) {
       const [rmRows] = await conn.query('SELECT name, stock_qty, cost_per_unit FROM raw_materials WHERE id=?', [mat.raw_material_id]);
-      if (!rmRows.length) return res.status(400).json({ message: `Raw material ID ${mat.raw_material_id} not found` });
+      if (!rmRows.length) {
+        await conn.rollback();
+        return res.status(400).json({ message: `Raw material ID ${mat.raw_material_id} not found` });
+      }
       const rm = rmRows[0];
       if (parseFloat(mat.qty) > parseFloat(rm.stock_qty)) {
+        await conn.rollback();
         return res.status(400).json({
           message: `Insufficient stock for "${rm.name}": required ${parseFloat(mat.qty).toFixed(2)}, available ${parseFloat(rm.stock_qty).toFixed(2)}`
         });
@@ -131,6 +153,8 @@ router.post('/batches', auth, async (req, res) => {
       mat._unit_cost = parseFloat(rm.cost_per_unit || 0);
       mat._total_cost = mat._unit_cost * parseFloat(mat.qty);
     }
+
+    const batch_code = await generateBatchCode(batch_date);
 
     // Sum up raw material cost
     let rawMaterialCost = materials.reduce((s, m) => s + m._total_cost, 0);
@@ -263,41 +287,76 @@ router.post('/yields', auth, async (req, res) => {
   await conn.beginTransaction();
   try {
     const { batch_id, items } = req.body;
-    if (!batch_id || !items || !items.length) return res.status(400).json({ message: 'Batch and items required' });
+    if (!batch_id || !Array.isArray(items) || !items.length) {
+      await conn.rollback();
+      return res.status(400).json({ message: 'Batch and items required' });
+    }
 
-    // Fetch batch
-    const [bRows] = await conn.query(`
-      SELECT b.*, u.to_base_factor as vol_factor
-      FROM mfg_batches b
-      LEFT JOIN units_of_measurement u ON b.volume_uom_id=u.id
-      WHERE b.id=?`, [batch_id]);
-    if (!bRows.length) return res.status(404).json({ message: 'Batch not found' });
+    // Fetch + lock batch so it can only be yielded once
+    const [bRows] = await conn.query('SELECT * FROM mfg_batches WHERE id=? FOR UPDATE', [batch_id]);
+    if (!bRows.length) {
+      await conn.rollback();
+      return res.status(404).json({ message: 'Batch not found' });
+    }
     const batch = bRows[0];
+    if (batch.status !== 'open') {
+      await conn.rollback();
+      return res.status(409).json({ message: `Batch ${batch.batch_code} has already been yielded` });
+    }
+    const batchUom = await getUom(conn, batch.volume_uom_id);
+    if (!batchUom) {
+      await conn.rollback();
+      return res.status(400).json({ message: `Batch ${batch.batch_code} has no valid volume unit` });
+    }
 
-    // Validate total packaged volume equals batch volume
-    const batchVolumeBase = toBase(batch.total_volume, batch.vol_factor);
+    // Validate total packaged volume equals batch volume — both sides in base units (g / ml)
+    const batchVolumeBase = toBase(batch.total_volume, batchUom.to_base_factor);
     let totalPackagedBase = 0;
 
     for (const item of items) {
-      const [puom] = await conn.query('SELECT to_base_factor FROM units_of_measurement WHERE id=?', [item.pack_volume_uom_id]);
-      const packFactor = puom[0]?.to_base_factor || 1;
-      const packVolumeBase = toBase(item.pack_volume, packFactor);
+      const units = Number(item.units_manufactured);
+      if (!Number.isInteger(units) || units <= 0) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Units manufactured must be a whole number greater than 0' });
+      }
+      if (!(parseFloat(item.pack_volume) > 0)) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Pack volume must be greater than 0' });
+      }
+      const packUom = await getUom(conn, item.pack_volume_uom_id);
+      if (!packUom) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Every yield item needs a valid pack volume unit' });
+      }
+      if (packUom.base_type !== batchUom.base_type) {
+        await conn.rollback();
+        return res.status(400).json({
+          message: `Pack unit "${packUom.symbol}" is ${packUom.base_type} but batch unit "${batchUom.symbol}" is ${batchUom.base_type}; they cannot be converted`
+        });
+      }
+      const packVolumeBase = toBase(item.pack_volume, packUom.to_base_factor);
+      item._units = units;
       item._pack_volume_base = packVolumeBase;
-      item._pack_factor = packFactor;
-      totalPackagedBase += packVolumeBase * parseInt(item.units_manufactured);
+      totalPackagedBase += packVolumeBase * units;
     }
 
     // Allow ±1% tolerance for rounding
     const diff = Math.abs(totalPackagedBase - batchVolumeBase);
     if (diff > batchVolumeBase * 0.01 + 1) {
+      const inBatchUom = (base) => (base / parseFloat(batchUom.to_base_factor)).toFixed(4).replace(/\.?0+$/, '');
+      await conn.rollback();
       return res.status(400).json({
-        message: `Volume mismatch: batch has ${batchVolumeBase.toFixed(2)} base units, yield uses ${totalPackagedBase.toFixed(2)}. Difference: ${diff.toFixed(2)}`
+        message: `Volume mismatch: batch has ${inBatchUom(batchVolumeBase)} ${batchUom.symbol}, yield packs ${inBatchUom(totalPackagedBase)} ${batchUom.symbol}`
       });
     }
 
+    // Cost per base unit from the same conversion used for the volume check above, so a UOM
+    // factor corrected after batch creation cannot leave a stale stored value in the costing.
+    const costPerBaseUnit = parseFloat(batch.total_cost) / batchVolumeBase;
+
     // Validate packaging material stock before committing anything
     for (const item of items) {
-      const units = parseInt(item.units_manufactured);
+      const units = item._units;
       // packaging_material_ids is an array from the UI; use the first one as primary (stored in mfg_yield_items)
       const packagingIds = Array.isArray(item.packaging_material_ids)
         ? item.packaging_material_ids.filter(id => id !== '' && id != null)
@@ -306,6 +365,7 @@ router.post('/yields', auth, async (req, res) => {
         const [pkgRM] = await conn.query('SELECT name, stock_qty FROM raw_materials WHERE id=?', [pkgId]);
         if (!pkgRM.length) continue;
         if (parseFloat(pkgRM[0].stock_qty) < units) {
+          await conn.rollback();
           return res.status(400).json({
             message: `Packaging material "${pkgRM[0].name}" has only ${parseFloat(pkgRM[0].stock_qty).toFixed(2)} units available, but ${units} are required.`
           });
@@ -318,11 +378,11 @@ router.post('/yields', auth, async (req, res) => {
     const yieldId = yResult.insertId;
 
     for (const item of items) {
-      const units = parseInt(item.units_manufactured);
+      const units = item._units;
       const packVolumeBase = item._pack_volume_base;
 
       // Batch cost contribution per unit
-      const batchCostPerUnit = parseFloat(batch.cost_per_base_unit) * packVolumeBase;
+      const batchCostPerUnit = costPerBaseUnit * packVolumeBase;
 
       // Packaging material ids (may be multiple from UI multi-select)
       const packagingIds = Array.isArray(item.packaging_material_ids)
@@ -413,8 +473,8 @@ router.post('/yields', auth, async (req, res) => {
       item._profit_pct = saleRate > 0 ? ((saleRate - unitCostWithTax) / saleRate * 100) : 0;
     }
 
-    // Mark batch yielded
-    await conn.query("UPDATE mfg_batches SET status='yielded' WHERE id=?", [batch_id]);
+    // Mark batch yielded; store the cost/base unit this yield was actually priced at
+    await conn.query("UPDATE mfg_batches SET status='yielded', cost_per_base_unit=? WHERE id=?", [costPerBaseUnit, batch_id]);
 
     await conn.commit();
 

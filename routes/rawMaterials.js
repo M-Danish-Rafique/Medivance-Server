@@ -11,24 +11,84 @@ router.get('/uom', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// to_base_factor = how many base units (g / ml / pcs) one of this unit holds, e.g. L → 1000.
+// Every manufacturing volume/cost conversion depends on it, so it is never defaulted.
+function parseUomInput(body) {
+  const name = String(body.name || '').trim();
+  const symbol = String(body.symbol || '').trim();
+  const { base_type } = body;
+  const factor = Number(body.to_base_factor);
+  if (!name || !symbol) return { error: 'Name and symbol required' };
+  if (!['count', 'weight', 'volume'].includes(base_type)) return { error: 'Type must be count, weight or volume' };
+  if (!Number.isFinite(factor) || factor <= 0) return { error: 'Conversion to base must be a number greater than 0' };
+  return { name, symbol, base_type, to_base_factor: factor };
+}
+
 router.post('/uom', auth, async (req, res) => {
   try {
-    const { name, symbol, base_type, to_base_factor } = req.body;
-    if (!name || !symbol || !base_type) return res.status(400).json({ message: 'Name, symbol and type required' });
+    const uom = parseUomInput(req.body);
+    if (uom.error) return res.status(400).json({ message: uom.error });
     const [result] = await db.query(
       'INSERT INTO units_of_measurement (name, symbol, base_type, to_base_factor) VALUES (?,?,?,?)',
-      [name, symbol, base_type, to_base_factor || 1]
+      [uom.name, uom.symbol, uom.base_type, uom.to_base_factor]
     );
-    res.status(201).json({ id: result.insertId, name, symbol, base_type, to_base_factor: to_base_factor || 1 });
+    res.status(201).json({ id: result.insertId, ...uom });
   } catch (err) {
     if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'UOM name already exists' });
     res.status(500).json({ message: err.message });
   }
 });
 
+// Correcting a factor/type re-prices open batches that use this UOM. Yielded batches and
+// yield items keep the costs they were recorded with.
+router.put('/uom/:id', auth, async (req, res) => {
+  const uom = parseUomInput(req.body);
+  if (uom.error) return res.status(400).json({ message: uom.error });
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.query('SELECT id FROM units_of_measurement WHERE id=? FOR UPDATE', [req.params.id]);
+    if (!rows.length) {
+      await conn.rollback();
+      return res.status(404).json({ message: 'UOM not found' });
+    }
+    await conn.query(
+      'UPDATE units_of_measurement SET name=?, symbol=?, base_type=?, to_base_factor=? WHERE id=?',
+      [uom.name, uom.symbol, uom.base_type, uom.to_base_factor, req.params.id]
+    );
+    const [repriced] = await conn.query(
+      `UPDATE mfg_batches SET cost_per_base_unit = total_cost / (total_volume * ?)
+       WHERE volume_uom_id=? AND status='open' AND total_volume > 0`,
+      [uom.to_base_factor, req.params.id]
+    );
+    await conn.commit();
+    res.json({ id: Number(req.params.id), ...uom, open_batches_repriced: repriced.affectedRows });
+  } catch (err) {
+    await conn.rollback();
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ message: 'UOM name already exists' });
+    res.status(500).json({ message: err.message });
+  } finally { conn.release(); }
+});
+
+// FKs to this table are ON DELETE SET NULL, which would silently strip the unit from
+// products/batches (conversions then fall back to nothing). Refuse while referenced.
 router.delete('/uom/:id', auth, async (req, res) => {
   try {
-    await db.query('DELETE FROM units_of_measurement WHERE id=?', [req.params.id]);
+    const id = req.params.id;
+    const [[refs]] = await db.query(
+      `SELECT
+         (SELECT COUNT(*) FROM products WHERE volume_uom_id=?) AS products,
+         (SELECT COUNT(*) FROM raw_materials WHERE uom_id=? OR volume_uom_id=?) AS raw_materials,
+         (SELECT COUNT(*) FROM mfg_batches WHERE volume_uom_id=?) AS batches,
+         (SELECT COUNT(*) FROM mfg_batch_materials WHERE uom_id=?) AS batch_materials,
+         (SELECT COUNT(*) FROM mfg_yield_items WHERE pack_volume_uom_id=?) AS yield_items`,
+      [id, id, id, id, id, id]
+    );
+    const inUse = Object.entries(refs).filter(([, n]) => Number(n) > 0).map(([k, n]) => `${n} ${k.replace('_', ' ')}`);
+    if (inUse.length) {
+      return res.status(409).json({ message: `UOM is in use (${inUse.join(', ')}). Edit it instead of deleting.` });
+    }
+    await db.query('DELETE FROM units_of_measurement WHERE id=?', [id]);
     res.json({ message: 'Deleted' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

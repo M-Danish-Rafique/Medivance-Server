@@ -5,6 +5,7 @@ const auth    = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
 const requirePermission = require('../middleware/requirePermission');
 const { loadOpenRun, monthBounds } = require('../utils/payrollRun');
+const { sumAdvances, listAdvances, fmtPKR } = require('../utils/salaryAdvances');
 const { todayPKT } = require('../utils/dateUtils');
 
 // ─── Salary slips ──────────────────────────────────────────────────────────
@@ -19,15 +20,27 @@ const { todayPKT } = require('../utils/dateUtils');
 // `deductions_json`, `target_amount`, `target_achieved` and `net_pay` are its
 // own snapshot.
 //
-// Three values are always recomputed server-side on both create and edit and
+// Five values are always recomputed server-side on both create and edit and
 // never taken from the request body, so a stale draft sitting in a browser tab
-// cannot be saved as fact: `target_achieved`, `target_amount` and `net_pay`.
+// cannot be saved as fact: `target_achieved`, `target_amount`,
+// `advance_amount`, `loan_balance` and `net_pay`.
+//
+// The money on a slip (product decision 2026-09-30):
+//   Net salary  = gross earnings - deductions (loan repayments included)
+//   Net payable = net salary - advance salary          -> salary_slips.net_pay
+// The advance is the SUM of the month's salary_advances (utils/salaryAdvances.js)
+// and is always deducted in full — the operator cannot change it here. Net
+// payable can never be negative. `loan_balance` is the loan still owed after
+// this slip's repayments, frozen with the slip for the printed "Total Pending
+// Loan" line.
 //
 // Cost to Company is recorded once per MONTH on the Pay Run (payroll_runs,
 // see routes/payrollRuns.js), never per slip.
 //
 // Every response splits deductions into `loan_recoveries` (lines tagged with a
-// loan_id — advances are recorded as loans) and `other_deductions`.
+// loan_id) and `other_deductions`. The printed slip merges every loan line into
+// one "Loan Deduction" row; storage stays per loan so each loan's balance is
+// still journalled in loan_repayments.
 //
 // Loan repayments tagged on a deduction line are journalled into
 // `loan_repayments`, which is the sole source of a loan's remaining balance
@@ -190,6 +203,13 @@ async function loadPayrollEmployee(conn, id) {
   return employee || null;
 }
 
+// Kept separate from loadPayrollEmployee: FOR UPDATE on that joined query
+// would also lock the department and designation rows, serialising every
+// payslip write in the same department.
+async function lockEmployeeRow(conn, id) {
+  await conn.query('SELECT id FROM hr_employees WHERE id=? FOR UPDATE', [id]);
+}
+
 // A slip only makes sense for a month the employee was actually on the books
 // for part of. Partial months (joined mid-month) are allowed. Inactive
 // employees have left and get no NEW slip at all (product decision 2026-09-22)
@@ -275,8 +295,9 @@ function sumLines(lines) {
 }
 
 // The breakdown every slip response carries, derived from the slip's own JSON
-// snapshot so it can never disagree with the lines.
-function slipFigures(earnings, deductions) {
+// snapshot (and its stored advance) so it can never disagree with the lines.
+// `net_pay` itself is the stored column: the net PAYABLE.
+function slipFigures(earnings, deductions, advanceAmount = 0) {
   const totalEarnings   = sumLines(earnings);
   const totalDeductions = sumLines(deductions);
   const loanRecoveries  = sumLines(deductions.filter(line => line.loan_id));
@@ -285,6 +306,8 @@ function slipFigures(earnings, deductions) {
     total_deductions: totalDeductions,
     loan_recoveries:  loanRecoveries,
     other_deductions: money(totalDeductions - loanRecoveries),
+    net_salary:       money(totalEarnings - totalDeductions),
+    advance_amount:   money(advanceAmount),
   };
 }
 
@@ -306,7 +329,8 @@ router.get('/', auth, perm, async (req, res) => {
 
     const [rows] = await db.query(`
       SELECT s.id, s.employee_id, s.month, s.earnings_json, s.deductions_json,
-             s.target_amount, s.target_achieved, s.net_pay, s.generated_at,
+             s.target_amount, s.target_achieved, s.advance_amount, s.loan_balance,
+             s.net_pay, s.generated_at,
              e.employee_id AS employee_code,
              e.name        AS employee_name,
              e.is_field_employee,
@@ -327,7 +351,7 @@ router.get('/', auth, perm, async (req, res) => {
         ...row,
         earnings,
         deductions,
-        ...slipFigures(earnings, deductions),
+        ...slipFigures(earnings, deductions, row.advance_amount),
       };
     }));
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -384,14 +408,16 @@ router.get('/draft', auth, perm, async (req, res) => {
       .map(c => ({ title: c.title, amount: money(c.amount) }));
 
     // One pre-filled, editable deduction line per outstanding loan, defaulted
-    // to the whole remaining balance. `loan_remaining` rides along so the UI
-    // can show the consequence of editing the figure.
+    // to the whole remaining balance. `loan_remaining` and `loan_title` ride
+    // along so the UI can list each loan and show the consequence of editing
+    // its figure; neither is stored (buildSlipWrite drops them).
     const loans = await loadOutstandingLoans(db, employeeId);
     for (const loan of loans) {
       deductions.push({
         title: `Loan repayment — ${loan.title}`,
         amount: money(loan.remaining_balance),
         loan_id: loan.id,
+        loan_title: loan.title,
         loan_remaining: money(loan.remaining_balance),
       });
     }
@@ -404,8 +430,15 @@ router.get('/draft', auth, perm, async (req, res) => {
 
     const target = await computeTargetAchieved(db, employee, month);
 
+    // The month's advances: shown on the draft as a fixed figure, never as
+    // an editable line. The save re-reads them, so one recorded meanwhile is
+    // still deducted.
+    const advances      = await listAdvances(db, employeeId, month);
+    const advanceAmount = sumLines(advances);
+
     const totalEarnings   = sumLines(earnings);
     const totalDeductions = sumLines(deductions);
+    const netSalary       = money(totalEarnings - totalDeductions);
     const attendance = await attendanceSummary(db, employee, month);
 
     res.json({
@@ -414,13 +447,16 @@ router.get('/draft', auth, perm, async (req, res) => {
       attendance,
       earnings,
       deductions,
+      advances,
+      advance_amount:  advanceAmount,
       target_amount:   targetAmount,
       target_achieved: target.achieved,
       target_basis:    target.basis,
       target_reason:   target.reason,
       total_earnings:   totalEarnings,
       total_deductions: totalDeductions,
-      net_pay: money(totalEarnings - totalDeductions),
+      net_salary: netSalary,
+      net_pay:    money(netSalary - advanceAmount),
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -439,11 +475,13 @@ router.get('/:id', auth, perm, async (req, res) => {
              DATE_FORMAT(e.date_of_leaving, '%Y-%m-%d') AS date_of_leaving,
              e.bank_name, e.account_title, e.account_number, e.iban,
              dep.name AS department_name,
-             des.name AS designation_name
+             des.name AS designation_name,
+             m.role   AS master_employee_role
         FROM salary_slips s
         JOIN hr_employees e   ON e.id  = s.employee_id
         JOIN departments  dep ON dep.id = e.department_id
         JOIN designations des ON des.id = e.designation_id
+        LEFT JOIN employees m ON m.id  = e.master_employee_id
        WHERE s.id = ?
     `, [req.params.id]);
 
@@ -481,11 +519,18 @@ router.get('/:id', auth, perm, async (req, res) => {
       date_of_leaving: row.date_of_leaving,
     }, row.month);
 
+    // The entries behind advance_amount, for the edit screen. On a slip in
+    // an open run they always add up to it (utils/salaryAdvances.js keeps the
+    // two in step).
+    const advances = await listAdvances(db, row.employee_id, row.month);
+
     res.json({
       ...row,
       earnings,
       deductions,
-      ...slipFigures(earnings, deductions),
+      ...slipFigures(earnings, deductions, row.advance_amount),
+      loan_balance: row.loan_balance === null ? null : money(row.loan_balance),
+      advances,
       attendance,
       payroll_run: run || null,
       is_editable: !!run && run.status === 'Open',
@@ -539,8 +584,12 @@ async function buildSlipWrite(conn, { employee, month, body, slipId = null }) {
     await conn.query('DELETE FROM loan_repayments WHERE salary_slip_id = ?', [slipId]);
   }
 
+  // Every outstanding loan is loaded (and locked), not only the ones this
+  // slip repays: the total still owed after this slip is frozen onto it.
+  const loans = await loadOutstandingLoans(conn, employee.id, { forUpdate: true });
+  const outstandingBefore = sumLines(loans.map(loan => ({ amount: loan.remaining_balance })));
+
   if (repaymentLines.length) {
-    const loans = await loadOutstandingLoans(conn, employee.id, { forUpdate: true });
     const outstandingById = new Map(loans.map(loan => [loan.id, loan]));
 
     // Two lines against one loan would each pass an individual balance check
@@ -593,7 +642,26 @@ async function buildSlipWrite(conn, { employee, month, body, slipId = null }) {
 
   const totalEarnings   = sumLines(earnings);
   const totalDeductions = sumLines(deductions);
-  const netPay          = money(totalEarnings - totalDeductions);
+  const netSalary       = money(totalEarnings - totalDeductions);
+
+  if (netSalary < 0) {
+    return {
+      error: {
+        status: 400,
+        body: {
+          field: 'deductions',
+          message: `Deductions of ${fmtPKR(totalDeductions)} exceed earnings of ${fmtPKR(totalEarnings)}. Reduce a deduction or spread a loan repayment across several months.`,
+        },
+      },
+    };
+  }
+
+  // The advance is read here, inside the transaction and after the employee
+  // row lock, with a LOCKING read so it reflects every advance committed up
+  // to now — including one recorded while the draft sat open (a plain read
+  // could return the transaction's older snapshot). Never taken from the body.
+  const advanceAmount = await sumAdvances(conn, employee.id, month, { lock: true });
+  const netPay        = money(netSalary - advanceAmount);
 
   if (netPay < 0) {
     return {
@@ -601,11 +669,14 @@ async function buildSlipWrite(conn, { employee, month, body, slipId = null }) {
         status: 400,
         body: {
           field: 'deductions',
-          message: `Deductions (${totalDeductions}) exceed earnings (${totalEarnings}), which would leave a negative net pay. Reduce a deduction — a loan repayment can be spread across months.`,
+          code: 'NET_PAYABLE_NEGATIVE',
+          message: `The advance salary of ${fmtPKR(advanceAmount)} paid for ${monthLabel(month)} exceeds the net salary of ${fmtPKR(netSalary)}. Advance salary is always deducted in full, so reduce a deduction or loan repayment.`,
         },
       },
     };
   }
+
+  const loanBalance = money(outstandingBefore - sumLines(repaymentLines));
 
   // The stored JSON keeps `loan_id` on repayment lines so a printed slip can
   // always be traced back to the loan it paid down, but drops the transient
@@ -623,6 +694,8 @@ async function buildSlipWrite(conn, { employee, month, body, slipId = null }) {
     targetAchieved: target.achieved,
     totalEarnings,
     totalDeductions,
+    advanceAmount,
+    loanBalance,
     netPay,
   };
 }
@@ -653,6 +726,10 @@ router.post('/', auth, perm, async (req, res) => {
       return res.status(runCheck.error.status).json(runCheck.error.body);
     }
 
+    // Serialises this write with an advance being recorded for the same
+    // person (utils/salaryAdvances.js takes the same lock, in the same order).
+    await lockEmployeeRow(conn, employeeId);
+
     const employee = await loadPayrollEmployee(conn, employeeId);
     if (!employee) {
       await conn.rollback();
@@ -673,12 +750,14 @@ router.post('/', auth, perm, async (req, res) => {
 
     const [result] = await conn.query(`
       INSERT INTO salary_slips
-        (employee_id, month, earnings_json, deductions_json, target_amount, target_achieved, net_pay)
-      VALUES (?,?,?,?,?,?,?)
+        (employee_id, month, earnings_json, deductions_json, target_amount, target_achieved,
+         advance_amount, loan_balance, net_pay)
+      VALUES (?,?,?,?,?,?,?,?,?)
     `, [
       employeeId, month,
       JSON.stringify(write.earningsJson), JSON.stringify(write.deductionsJson),
-      write.targetAmount, write.targetAchieved, write.netPay,
+      write.targetAmount, write.targetAchieved,
+      write.advanceAmount, write.loanBalance, write.netPay,
     ]);
 
     const slipId = result.insertId;
@@ -692,7 +771,8 @@ router.post('/', auth, perm, async (req, res) => {
 
     await conn.commit();
     await logAudit(req, 'CREATE', 'hr/salary-slips', slipId,
-      `Salary slip for ${employee.employee_id} (${employee.name}) ${month} — net ${write.netPay}`);
+      `Salary slip for ${employee.employee_id} (${employee.name}) ${month} — net payable ${write.netPay}`
+      + (write.advanceAmount ? ` after advance ${write.advanceAmount}` : ''));
 
     res.status(201).json({
       id: slipId,
@@ -702,8 +782,9 @@ router.post('/', auth, perm, async (req, res) => {
       deductions: write.deductionsJson,
       target_amount: write.targetAmount,
       target_achieved: write.targetAchieved,
+      loan_balance: write.loanBalance,
       net_pay: write.netPay,
-      ...slipFigures(write.earningsJson, write.deductionsJson),
+      ...slipFigures(write.earningsJson, write.deductionsJson, write.advanceAmount),
     });
   } catch (err) {
     await conn.rollback();
@@ -726,24 +807,33 @@ router.post('/', auth, perm, async (req, res) => {
 router.put('/:id', auth, perm, async (req, res) => {
   const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    // Locked so a concurrent complete-session or second edit cannot interleave
-    // with the repayment re-journalling below.
-    const [[slip]] = await conn.query(
-      'SELECT id, employee_id, month FROM salary_slips WHERE id=? FOR UPDATE',
+    // employee_id and month never change, so they are read BEFORE the
+    // transaction starts: a plain read inside it would fix its snapshot ahead
+    // of the lock waits below. The locks are then taken in the order every
+    // payroll write uses (run -> employee -> slip -> loans), so a concurrent
+    // close, second edit or advance cannot interleave with the repayment
+    // re-journalling below.
+    const [[slipRef]] = await conn.query(
+      'SELECT id, employee_id, month FROM salary_slips WHERE id=?',
       [req.params.id]
     );
-    if (!slip) {
-      await conn.rollback();
+    if (!slipRef) {
       return res.status(404).json({ message: 'Salary slip not found' });
     }
 
-    const runCheck = await loadOpenRun(conn, slip.month, { lock: true });
+    await conn.beginTransaction();
+
+    const runCheck = await loadOpenRun(conn, slipRef.month, { lock: true });
     if (runCheck.error) {
       await conn.rollback();
       return res.status(runCheck.error.status).json(runCheck.error.body);
     }
+
+    await lockEmployeeRow(conn, slipRef.employee_id);
+    const [[slip]] = await conn.query(
+      'SELECT id, employee_id, month FROM salary_slips WHERE id=? FOR UPDATE',
+      [slipRef.id]
+    );
 
     const employee = await loadPayrollEmployee(conn, slip.employee_id);
     if (!employee) {
@@ -764,11 +854,13 @@ router.put('/:id', auth, perm, async (req, res) => {
 
     await conn.query(`
       UPDATE salary_slips
-         SET earnings_json=?, deductions_json=?, target_amount=?, target_achieved=?, net_pay=?
+         SET earnings_json=?, deductions_json=?, target_amount=?, target_achieved=?,
+             advance_amount=?, loan_balance=?, net_pay=?
        WHERE id=?
     `, [
       JSON.stringify(write.earningsJson), JSON.stringify(write.deductionsJson),
-      write.targetAmount, write.targetAchieved, write.netPay, slip.id,
+      write.targetAmount, write.targetAchieved,
+      write.advanceAmount, write.loanBalance, write.netPay, slip.id,
     ]);
 
     // buildSlipWrite already removed this slip's old repayment rows; re-insert
@@ -782,7 +874,8 @@ router.put('/:id', auth, perm, async (req, res) => {
 
     await conn.commit();
     await logAudit(req, 'UPDATE', 'hr/salary-slips', slip.id,
-      `Edited salary slip for ${employee.employee_id} (${employee.name}) ${slip.month} — net ${write.netPay}`);
+      `Edited salary slip for ${employee.employee_id} (${employee.name}) ${slip.month} — net payable ${write.netPay}`
+      + (write.advanceAmount ? ` after advance ${write.advanceAmount}` : ''));
 
     res.json({
       message: 'Salary slip updated',
@@ -793,8 +886,9 @@ router.put('/:id', auth, perm, async (req, res) => {
       deductions: write.deductionsJson,
       target_amount: write.targetAmount,
       target_achieved: write.targetAchieved,
+      loan_balance: write.loanBalance,
       net_pay: write.netPay,
-      ...slipFigures(write.earningsJson, write.deductionsJson),
+      ...slipFigures(write.earningsJson, write.deductionsJson, write.advanceAmount),
     });
   } catch (err) {
     await conn.rollback();
