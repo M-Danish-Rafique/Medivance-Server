@@ -6,6 +6,7 @@ const { logAudit } = require('../middleware/auditLog');
 const requirePermission = require('../middleware/requirePermission');
 const { nowPKT } = require('../utils/dateUtils');
 const { loadPendingEmployees, countEligibleEmployees } = require('../utils/payrollRun');
+const { fmtPKR, monthLabel } = require('../utils/salaryAdvances');
 
 // ─── Payroll runs (monthly payroll sessions) ────────────────────────────────
 // One run per month. The operator opens it, adds a slip per employee,
@@ -24,11 +25,17 @@ const { loadPendingEmployees, countEligibleEmployees } = require('../utils/payro
 // Cost to Company is ONE figure per month, recorded on the run when it is
 // closed (payroll_runs.cost_to_company, migration add_payroll_ctc.sql). The
 // close request may carry the operator's figure; without one the calculated
-// figure is stored: gross earnings less deductions, EXCLUDING loan repayments
-// (they settle money already lent) and never reduced by advance salary (the
-// same salary, paid earlier) — product decision 2026-10-01, which replaced the
-// earlier "CTC = gross" rule. NULL = not recorded (open, or closed before the
-// column).
+// figure is stored: the sum of every payslip's NET SALARY, i.e. gross earnings
+// less deductions AND loan repayments, before the advance comes off (advance
+// salary is the same salary, paid earlier) — product decision 2026-10-05,
+// which replaced the 2026-10-01 rule that left loan repayments in. NULL = not
+// recorded (open, or closed before the column).
+//
+// Closing also posts that figure to Finance as ONE Salary Expense row, in the
+// same transaction (migration add_finance_payroll_link.sql): if the insert
+// fails the run stays Open. finance.payroll_run_id is UNIQUE, so a run can
+// never post twice, and DELETE /finance/:id refuses the row. A cost to company
+// of 0 closes the run without a Finance row.
 //
 // `total_net` below is the sum of salary_slips.net_pay, i.e. net PAYABLE —
 // the cash still to disburse after each month's advances.
@@ -52,6 +59,22 @@ function parseJsonColumn(value) {
     catch { return []; }
   }
   return [];
+}
+
+// finance.amount is DECIMAL(12,2); the Salary Expense must fit in it.
+const MAX_COST_TO_COMPANY = 9999999999.99;
+const SALARY_EXPENSE_TYPE = 'Salaries and Wages';
+
+// The expense head the Salary Expense is filed under. Created on demand (an
+// operator can delete expense types in Finance); expense_types.name is UNIQUE
+// and case-insensitive, so an existing head is reused. LAST_INSERT_ID(id)
+// makes insertId the existing row's id on the duplicate path.
+async function salaryExpenseTypeId(conn) {
+  const [result] = await conn.query(
+    'INSERT INTO expense_types (name) VALUES (?) ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)',
+    [SALARY_EXPENSE_TYPE]
+  );
+  return result.insertId;
 }
 
 function isValidMonthString(value) {
@@ -185,12 +208,12 @@ router.put('/:id/complete', auth, perm, async (req, res) => {
     }
 
     // Monthly Cost to Company, calculated from the slips' own snapshots (read
-    // under the run's exclusive lock, so the slip set cannot change): gross
-    // earnings less deductions, EXCLUDING loan repayments (lines tagged with a
-    // loan_id — they return money lent earlier) and never reduced by advance
-    // salary (the same salary, paid early). Product decision 2026-10-01;
-    // mirrored by monthTotals.ctc in SalarySlips.jsx. The operator's figure
-    // replaces it when one is sent.
+    // under the run's exclusive lock, so the slip set cannot change): the sum
+    // of every payslip's net salary = gross earnings less ALL deductions,
+    // loan repayments (lines tagged with a loan_id) included. Advance salary
+    // never reduces it (the same salary, paid early). Product decision
+    // 2026-10-05; mirrored by monthTotals.ctc in SalarySlips.jsx. The
+    // operator's figure replaces it when one is sent.
     const [slipRows] = await conn.query(
       'SELECT earnings_json, deductions_json FROM salary_slips WHERE month = ?',
       [run.month]
@@ -199,28 +222,65 @@ router.put('/:id/complete', auth, perm, async (req, res) => {
     const calculatedCtc = money(slipRows.reduce((total, row) => (
       total
         + lineSum(parseJsonColumn(row.earnings_json))
-        - lineSum(parseJsonColumn(row.deductions_json).filter(line => !line.loan_id))
+        - lineSum(parseJsonColumn(row.deductions_json))
     ), 0));
 
     let costToCompany = calculatedCtc;
     const rawCtc = req.body ? req.body.cost_to_company : undefined;
     if (rawCtc !== undefined && rawCtc !== null && rawCtc !== '') {
       const parsed = parseFloat(rawCtc);
-      if (!Number.isFinite(parsed) || parsed < 0 || parsed > 999999999999.99) {
+      if (!Number.isFinite(parsed) || parsed < 0) {
         await conn.rollback();
-        return res.status(400).json({ field: 'cost_to_company', message: 'Cost to company must be zero or more' });
+        return res.status(400).json({ field: 'cost_to_company', message: 'Enter a cost to company of zero or more.' });
       }
       costToCompany = money(parsed);
     }
+    if (costToCompany > MAX_COST_TO_COMPANY) {
+      await conn.rollback();
+      return res.status(400).json({
+        field: 'cost_to_company',
+        message: `Cost to company cannot exceed ${fmtPKR(MAX_COST_TO_COMPANY)}. Enter a smaller amount.`,
+      });
+    }
+
+    // One instant for both the close stamp and the Salary Expense date, so a
+    // close at midnight cannot date the expense a day apart from the run. The
+    // expense is dated the PKT day the run is CLOSED, not its pay period: a
+    // September run closed on 5 October posts on 5 October.
+    const closedAt = nowPKT();
+    const closedOn = closedAt.slice(0, 10);
 
     await conn.query(
       'UPDATE payroll_runs SET status=?, completed_at=?, completed_by=?, cost_to_company=? WHERE id=?',
-      ['Completed', nowPKT(), req.user.id, costToCompany, run.id]
+      ['Completed', closedAt, req.user.id, costToCompany, run.id]
     );
+
+    // Same transaction: if the Finance row cannot be written, the rollback in
+    // the catch below leaves the run Open.
+    let financeId = null;
+    if (costToCompany > 0) {
+      try {
+        const expenseTypeId = await salaryExpenseTypeId(conn);
+        const [fin] = await conn.query(
+          `INSERT INTO finance (date, category, description, expense_type_id, amount, payroll_run_id)
+           VALUES (?, 'Expense', ?, ?, ?, ?)`,
+          [closedOn, `Salary Expense — ${monthLabel(run.month)}`, expenseTypeId, costToCompany, run.id]
+        );
+        financeId = fin.insertId;
+      } catch (finErr) {
+        console.error('Pay Run close: Salary Expense insert failed', finErr);
+        const duplicate = finErr.code === 'ER_DUP_ENTRY';
+        throw Object.assign(new Error(duplicate
+          ? `A Salary Expense for the ${monthLabel(run.month)} Pay Run is already recorded in Finance. The Pay Run is still open.`
+          : `The Salary Expense could not be recorded in Finance. The ${monthLabel(run.month)} Pay Run is still open. Try again.`
+        ), { status: duplicate ? 409 : 500 });
+      }
+    }
 
     await conn.commit();
     await logAudit(req, 'STATUS_CHANGE', 'hr/payroll-runs', run.id,
-      `Finalized payroll for ${run.month} — ${counts.slip_count} slip${counts.slip_count === 1 ? '' : 's'} locked, cost to company ${costToCompany}${costToCompany !== calculatedCtc ? ` (calculated ${calculatedCtc})` : ''}`);
+      `Finalized payroll for ${run.month} — ${counts.slip_count} slip${counts.slip_count === 1 ? '' : 's'} locked, cost to company ${costToCompany}${costToCompany !== calculatedCtc ? ` (calculated ${calculatedCtc})` : ''}`
+      + (financeId ? `; Salary Expense recorded in Finance (#${financeId})` : '; no Finance entry (zero cost to company)'));
 
     res.json({
       message: `Payroll for ${run.month} finalized`,
@@ -230,10 +290,11 @@ router.put('/:id/complete', auth, perm, async (req, res) => {
       slip_count: counts.slip_count,
       cost_to_company: costToCompany,
       calculated_cost_to_company: calculatedCtc,
+      finance_id: financeId,
     });
   } catch (err) {
     await conn.rollback();
-    res.status(500).json({ message: err.message });
+    res.status(err.status || 500).json({ message: err.message });
   } finally {
     conn.release();
   }
