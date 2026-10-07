@@ -8,6 +8,7 @@ const { todayPKT, addMonthsPKT } = require('../utils/dateUtils');
 const {
   PAISA, fmtPKR, monthLabel, loadAdvanceContext, syncSlipAdvance,
 } = require('../utils/salaryAdvances');
+const { makeEmployeeCode, setEmployeeStatus } = require('../utils/masterEmployees');
 
 // ─── HR employee profiles ──────────────────────────────────────────────────
 // Separate from Master Data `employees`, which stays exactly as-is: it is
@@ -16,6 +17,10 @@ const {
 // An HR profile may *point at* a master row via master_employee_id (nullable,
 // ON DELETE SET NULL) — that link is what makes sales-target achievement
 // computable for field staff.
+//
+// Status sync is one-way and opt-in: PUT /:id with `sync_master: true` also
+// sets the linked master row to the new HR status, in the same transaction.
+// Changing a status in Master Data never changes HR.
 //
 // There is deliberately no DELETE endpoint. Deactivation (status=Inactive +
 // date_of_leaving + reason_for_leaving) is the real exit path; a hard delete
@@ -253,13 +258,23 @@ async function validateCoreFields(conn, body, { employeeId = null } = {}) {
 
 // One HR profile may link to at most one Master Data row and vice versa —
 // two profiles sharing a salesman would double-count that salesman's sales
-// against two different salary slips.
+// against two different salary slips. A new link must also point at an
+// Active row; an existing link to a row deactivated since is kept (PUT only
+// calls this when the link changes).
 async function assertMasterLinkFree(conn, masterEmployeeId, excludeHrId) {
   if (!masterEmployeeId) return null;
 
-  const [[master]] = await conn.query('SELECT id, name, cnic, phone, role FROM employees WHERE id=?', [masterEmployeeId]);
+  const [[master]] = await conn.query('SELECT id, name, cnic, phone, role, status FROM employees WHERE id=?', [masterEmployeeId]);
   if (!master) {
     return { error: { field: 'master_employee_id', message: 'That Master Data employee no longer exists' } };
+  }
+  if (master.status === 'Inactive') {
+    return {
+      error: {
+        field: 'master_employee_id',
+        message: `${master.name} (${makeEmployeeCode(master.role, master.id)}) is inactive in Master Data. Reactivate the record there, or choose another.`,
+      },
+    };
   }
 
   const params = [masterEmployeeId];
@@ -275,6 +290,17 @@ async function assertMasterLinkFree(conn, masterEmployeeId, excludeHrId) {
     };
   }
   return { master };
+}
+
+// The master record's code (EMP-SM-003) is derived from role + id, never
+// stored, so it is attached after the query.
+function withMasterCode(row) {
+  return {
+    ...row,
+    master_employee_code: row.master_employee_id && row.master_employee_role
+      ? makeEmployeeCode(row.master_employee_role, row.master_employee_id)
+      : null,
+  };
 }
 
 // ── GET / — list for the table view ────────────────────────────────────────
@@ -295,16 +321,23 @@ router.get('/', auth, permRoster, async (req, res) => {
     const [rows] = await db.query(`
       SELECT e.id, e.employee_id, e.name, e.status, e.is_field_employee,
              e.master_employee_id,
+             m.name    AS master_employee_name,
+             m.role    AS master_employee_role,
+             m.status  AS master_employee_status,
+             DATE_FORMAT(m.deactivated_at, '%Y-%m-%d %H:%i:%s') AS master_employee_deactivated_at,
              dep.name  AS department_name,
              des.name  AS designation_name
         FROM hr_employees e
         JOIN departments  dep ON dep.id = e.department_id
         JOIN designations des ON des.id = e.designation_id
+        LEFT JOIN employees m ON m.id = e.master_employee_id
         ${where}
        ORDER BY e.name
     `, params);
 
-    res.json(rows);
+    // The linked Master Data record rides along so the status dialog can offer
+    // to sync it without another request.
+    res.json(rows.map(withMasterCode));
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -327,7 +360,9 @@ router.get('/:id', auth, perm, async (req, res) => {
              mgr.name AS reporting_manager_name,
              mgr.employee_id AS reporting_manager_code,
              m.name   AS master_employee_name,
-             m.role   AS master_employee_role
+             m.role   AS master_employee_role,
+             m.status AS master_employee_status,
+             DATE_FORMAT(m.deactivated_at, '%Y-%m-%d %H:%i:%s') AS master_employee_deactivated_at
         FROM hr_employees e
         JOIN departments  dep ON dep.id = e.department_id
         JOIN designations des ON des.id = e.designation_id
@@ -397,7 +432,7 @@ router.get('/:id', auth, perm, async (req, res) => {
     `, [id]);
 
     res.json({
-      ...employee,
+      ...withMasterCode(employee),
       salary_components: components,
       sales_target: target ? money(target.target_amount) : null,
       sales_target_updated_at: target ? target.updated_at : null,
@@ -585,17 +620,45 @@ router.put('/:id', auth, perm, async (req, res) => {
       fields.account_number, fields.iban, id,
     ]);
 
+    // Opt-in sync to the linked Master Data record (the dialog's "Also
+    // deactivate / reactivate … in Master Data" checkbox). Only on a real HR
+    // status change, only for the record linked after this save, and in this
+    // same transaction: if either write fails, neither is saved.
+    const statusChanged = requestedStatus !== existing.status;
+    let masterSynced = null;
+    if (req.body.sync_master === true && statusChanged && masterEmployeeId) {
+      const master = await setEmployeeStatus(conn, masterEmployeeId, requestedStatus, req.user?.id);
+      if (master && master.changed) masterSynced = master;
+    }
+
     await conn.commit();
 
-    const statusChanged = requestedStatus !== existing.status;
     await logAudit(
       req, statusChanged ? 'STATUS_CHANGE' : 'UPDATE', 'hr/employees', id,
       statusChanged
         ? `${existing.employee_id} (${fields.name}) set to ${requestedStatus}${dateOfLeaving ? ` from ${dateOfLeaving}` : ''}`
         : `Updated HR employee ${existing.employee_id} (${fields.name})`
     );
+    if (masterSynced) {
+      await logAudit(req, 'STATUS_CHANGE', 'employees', masterSynced.id,
+        `${masterSynced.employee_code} (${masterSynced.name}) set to ${requestedStatus} with HR profile ${existing.employee_id}`);
+    }
 
-    res.json({ message: 'Employee updated', id: Number(id), employee_id: existing.employee_id, status: requestedStatus });
+    res.json({
+      message: 'Employee updated',
+      id: Number(id),
+      employee_id: existing.employee_id,
+      status: requestedStatus,
+      master_synced: masterSynced
+        ? {
+          id: masterSynced.id,
+          employee_code: masterSynced.employee_code,
+          name: masterSynced.name,
+          role: masterSynced.role,
+          status: masterSynced.status,
+        }
+        : null,
+    });
   } catch (err) {
     await conn.rollback();
     res.status(500).json({ message: err.message });

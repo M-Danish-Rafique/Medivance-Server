@@ -5,6 +5,7 @@ const auth    = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
 const { canViewPurchaseRate } = require('../utils/purchaseRateAccess');
 const { yearPKT } = require('../utils/dateUtils');
+const { assertSelectableEmployee } = require('../utils/masterEmployees');
 
 // ─── Sale lifecycle (post 2026-08 refactor) ────────────────────────────────
 // Every write path now:
@@ -229,6 +230,8 @@ router.get('/:id', auth, async (req, res) => {
              c.ntn, c.strn,
              e.name as salesman_name,
              d.name as delivery_by_name,
+             e.status as salesman_status,
+             d.status as delivery_by_status,
              ci.name as city_name, a.name as area_name, t.name as territory_name
       FROM sales s
       JOIN customers c ON s.customer_id=c.id
@@ -292,6 +295,10 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ message: 'Customer, date and items are required' });
     }
 
+    // A new invoice can only name active people (422 otherwise).
+    const salesmanId   = await assertSelectableEmployee(conn, salesman_id, { label: 'salesman' });
+    const deliveryById = await assertSelectableEmployee(conn, delivery_by, { label: 'supplier' });
+
     const invoice_no = await generateInvoiceNo(date);
     const total_amount = items.reduce((sum, i) => sum + parseFloat(i.total || 0), 0);
 
@@ -300,7 +307,7 @@ router.post('/', auth, async (req, res) => {
          (invoice_no, customer_id, salesman_id, delivery_by, date,
           total_amount, net_collectible, pending_amount, is_locked)
        VALUES (?,?,?,?,?,?,?,?,0)`,
-      [invoice_no, customer_id, salesman_id || null, delivery_by || null, date,
+      [invoice_no, customer_id, salesmanId, deliveryById, date,
        total_amount, total_amount, total_amount]
     );
     const sId = result.insertId;
@@ -416,6 +423,15 @@ router.put('/:id', auth, async (req, res) => {
 
     const { customer_id, salesman_id, delivery_by, date, items } = req.body;
 
+    // An inactive person may stay on the invoice only if they are already
+    // saved there; switching to an inactive person is refused (422).
+    const salesmanId = await assertSelectableEmployee(conn, salesman_id, {
+      label: 'salesman', keepIds: [sale.salesman_id],
+    });
+    const deliveryById = await assertSelectableEmployee(conn, delivery_by, {
+      label: 'supplier', keepIds: [sale.delivery_by],
+    });
+
     // ── Restore old inventory (journal each restoration) ──────────────
     const [oldItems] = await conn.query(
       'SELECT * FROM sale_items WHERE sale_id=?', [req.params.id]);
@@ -450,7 +466,7 @@ router.put('/:id', auth, async (req, res) => {
          SET customer_id=?, salesman_id=?, delivery_by=?, date=?,
              total_amount=?, net_collectible=?, pending_amount=?
        WHERE id=?`,
-      [customer_id, salesman_id || null, delivery_by || null, date,
+      [customer_id, salesmanId, deliveryById, date,
        total_amount, total_amount, total_amount, req.params.id]
     );
 

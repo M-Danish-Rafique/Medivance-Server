@@ -4,6 +4,7 @@ const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
 const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
+const { assertSelectableEmployee } = require('../utils/masterEmployees');
 
 // ─── Recovery lifecycle (post 2026-08 refactor) ────────────────────────────
 // A recovery event captures three kinds of activity against a single sale
@@ -739,6 +740,13 @@ router.post('/', auth, async (req, res) => {
       }
     }
 
+    // An inactive person is accepted only if they are already on the invoice:
+    // its Delivery By (a recovery stays credited to the original supplier) or
+    // its Salesman (Quick Return credits the invoice's salesman).
+    const recoveryPersonId = await assertSelectableEmployee(conn, salesman_id, {
+      label: 'supplier', keepIds: [currentSale.delivery_by, currentSale.salesman_id],
+    });
+
     const isAdmin = req.user?.role === 'admin';
     const expiryWarnings = await validateReturnExpiries(conn, return_items, isAdmin);
     const computedRates = await validateRecoveryPayload(conn, currentSale, recovery_items, return_items);
@@ -804,7 +812,7 @@ router.post('/', auth, async (req, res) => {
          (sale_id, salesman_id, date, notes, total_discount,
           total_return_amount, net_collectible, net_collected, pending_amount)
        VALUES (?,?,?,?,?,?,?,?,?)`,
-      [sale_id, salesman_id || null, date, notes || null,
+      [sale_id, recoveryPersonId, date, notes || null,
        eventDiscount, eventReturnAmount, netCollectible, recoveredAmount, 0]
     );
     const recoveryId = ins.insertId;
