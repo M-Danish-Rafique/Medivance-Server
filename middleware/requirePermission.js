@@ -25,6 +25,12 @@ const KNOWN_FLAGS = new Set([
   'perm_hr_employees',
   'perm_hr_attendance',
   'perm_hr_payroll',
+  // Manufacturing exposes production costs, so its routers gate too: any of
+  // the four flags reads, the screen's own flag writes.
+  'perm_mfg_products',
+  'perm_mfg_raw_materials',
+  'perm_mfg_batches',
+  'perm_mfg_yields',
 ]);
 
 function buildGate(flags, moduleLabel) {
