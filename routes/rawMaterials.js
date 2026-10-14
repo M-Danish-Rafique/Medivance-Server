@@ -16,9 +16,9 @@ const {
 // name `purchase_rate`). Each purchase line moves it:
 //   new rate = (max(stock before, 0) × rate + qty × landed rate) ÷ (stock before + qty)
 // and using stock in a batch never changes it. A batch freezes the rate of
-// each material when it takes the stock (manufacturing.js). Deleting a
-// purchase, or a batch that took stock, rebuilds the average from the stock
-// ledger in date order (replayAverageRate). The rate is typed by hand only
+// each material when it takes the stock (manufacturing.js). Editing or
+// deleting a purchase, or deleting a batch that took stock, rebuilds the
+// average from the stock ledger in date order (replayAverageRate). The rate is typed by hand only
 // until the material's first purchase.
 
 const MFG_FLAGS = ['perm_mfg_products', 'perm_mfg_raw_materials', 'perm_mfg_batches', 'perm_mfg_yields'];
@@ -349,6 +349,73 @@ router.get('/purchases/:id', auth, canRead, async (req, res) => {
   } catch (err) { sendError(res, err, 'The purchase could not be loaded.'); }
 });
 
+// Header fields of a purchase body (create and edit). The supplier row must
+// already be locked by the caller; `savedSupplierId` (edit) keeps the
+// purchase's own supplier valid even if its type has changed since.
+function readPurchaseHeader(body, supplier, savedSupplierId) {
+  if (!supplier || (!['raw_material', 'both'].includes(supplier.supplier_type) && supplier.id !== savedSupplierId)) {
+    throw fail(400, 'Choose a raw material supplier from the list.', { field: 'supplier_id' });
+  }
+  if (!isDate(body.date)) throw fail(400, 'Enter the purchase date.', { field: 'date' });
+  if (body.date > todayPKT()) throw fail(400, 'The purchase date cannot be in the future.', { field: 'date' });
+  const invoiceNo = cleanText(body.invoice_no) || null;
+  if (invoiceNo && invoiceNo.length > 100) throw fail(400, 'The invoice number must have 100 characters or fewer.', { field: 'invoice_no' });
+  const charges = body.other_charges === '' || body.other_charges == null ? 0 : num(body.other_charges);
+  if (!Number.isFinite(charges) || charges < 0) throw fail(400, 'Enter other charges of 0 or more.', { field: 'other_charges' });
+  if (charges > MAX_MONEY || !decimalsOk(charges, 2)) throw fail(400, 'Enter other charges with at most 2 decimals.', { field: 'other_charges' });
+  const chargesNote = cleanText(body.charges_note) || null;
+  if (chargesNote && chargesNote.length > 150) throw fail(400, 'The note must have 150 characters or fewer.', { field: 'charges_note' });
+  return { invoiceNo, charges, chargesNote };
+}
+
+const supplierIdOf = (body) => {
+  const id = Number(body.supplier_id);
+  if (!Number.isInteger(id) || id <= 0) throw fail(400, 'Choose the supplier.', { field: 'supplier_id' });
+  return id;
+};
+
+const lineMaterialIds = (linesIn) => linesIn.map(l => Number(l.raw_material_id)).filter(id => Number.isInteger(id) && id > 0);
+
+/** Locks the materials in id order (callers lock every material they touch in ONE call). */
+async function lockMaterials(conn, ids) {
+  const sorted = [...new Set(ids)].sort((a, b) => a - b);
+  const rmById = new Map();
+  if (!sorted.length) return rmById;
+  const [rmRows] = await conn.query(
+    `SELECT rm.id, rm.name, rm.stock_qty, rm.cost_per_unit, u.symbol AS uom_symbol, u.base_type
+       FROM raw_materials rm LEFT JOIN units_of_measurement u ON u.id = rm.uom_id
+      WHERE rm.id IN (?) ORDER BY rm.id FOR UPDATE`, [sorted]
+  );
+  rmRows.forEach(r => rmById.set(r.id, r));
+  return rmById;
+}
+
+/** Validated lines + their landed costs: { lines: [{ rm, qty, rate }], costs, itemsTotal }. */
+function readPurchaseLines(linesIn, rmById, charges) {
+  if (!linesIn.length) throw fail(400, 'Add at least one material.', { field: 'lines' });
+  const seen = new Set();
+  const lines = linesIn.map((l, i) => {
+    const rm = rmById.get(Number(l.raw_material_id));
+    if (!rm) throw fail(400, 'Choose a material on every line.', { field: 'lines', line: i });
+    if (seen.has(rm.id)) throw fail(400, `${rm.name} is listed twice. Combine the quantities on one line.`, { field: 'lines', line: i });
+    seen.add(rm.id);
+    const qty = num(l.qty);
+    if (!(qty > 0)) throw fail(400, `Enter a quantity greater than 0 for ${rm.name}.`, { field: 'lines', line: i });
+    if (rm.base_type === 'count' && !Number.isInteger(qty)) throw fail(400, `Enter a whole number of ${rm.uom_symbol} for ${rm.name}.`, { field: 'lines', line: i });
+    if (qty > 9999999999 || !decimalsOk(qty, 4)) throw fail(400, `Enter the quantity of ${rm.name} with at most 4 decimals.`, { field: 'lines', line: i });
+    const rate = num(l.rate);
+    if (!(rate > 0)) throw fail(400, `Enter a rate greater than 0 for ${rm.name}.`, { field: 'lines', line: i });
+    if (rate > MAX_MONEY || !decimalsOk(rate, 4)) throw fail(400, `Enter the rate of ${rm.name} with at most 4 decimals.`, { field: 'lines', line: i });
+    return { rm, qty, rate };
+  });
+  const costs = landedRates(lines, charges);
+  const itemsTotal = round2(costs.reduce((s, c) => s + c.lineTotal, 0));
+  if (itemsTotal > MAX_MONEY) throw fail(400, 'The purchase total is too large to record.', { field: 'lines' });
+  return { lines, costs, itemsTotal };
+}
+
+const ledgerDescription = (purchaseNo, invoiceNo) => `Purchase ${purchaseNo}${invoiceNo ? ` (invoice ${invoiceNo})` : ''}`;
+
 router.post('/purchases', auth, canEdit, async (req, res) => {
   const conn = await db.getConnection();
   try {
@@ -356,53 +423,14 @@ router.post('/purchases', auth, canEdit, async (req, res) => {
     const body = req.body || {};
 
     // Header
-    const supplierId = Number(body.supplier_id);
-    if (!Number.isInteger(supplierId) || supplierId <= 0) throw fail(400, 'Choose the supplier.', { field: 'supplier_id' });
+    const supplierId = supplierIdOf(body);
     const [[supplier]] = await conn.query('SELECT id, name, supplier_type FROM suppliers WHERE id = ? FOR UPDATE', [supplierId]);
-    if (!supplier || !['raw_material', 'both'].includes(supplier.supplier_type)) {
-      throw fail(400, 'Choose a raw material supplier from the list.', { field: 'supplier_id' });
-    }
-    if (!isDate(body.date)) throw fail(400, 'Enter the purchase date.', { field: 'date' });
-    if (body.date > todayPKT()) throw fail(400, 'The purchase date cannot be in the future.', { field: 'date' });
-    const invoiceNo = cleanText(body.invoice_no) || null;
-    if (invoiceNo && invoiceNo.length > 100) throw fail(400, 'The invoice number must have 100 characters or fewer.', { field: 'invoice_no' });
-    const charges = body.other_charges === '' || body.other_charges == null ? 0 : num(body.other_charges);
-    if (!Number.isFinite(charges) || charges < 0) throw fail(400, 'Enter other charges of 0 or more.', { field: 'other_charges' });
-    if (charges > MAX_MONEY || !decimalsOk(charges, 2)) throw fail(400, 'Enter other charges with at most 2 decimals.', { field: 'other_charges' });
-    const chargesNote = cleanText(body.charges_note) || null;
-    if (chargesNote && chargesNote.length > 150) throw fail(400, 'The note must have 150 characters or fewer.', { field: 'charges_note' });
+    const { invoiceNo, charges, chargesNote } = readPurchaseHeader(body, supplier);
 
     // Lines (materials locked in id order)
     const linesIn = Array.isArray(body.lines) ? body.lines : [];
-    if (!linesIn.length) throw fail(400, 'Add at least one material.', { field: 'lines' });
-    const ids = [...new Set(linesIn.map(l => Number(l.raw_material_id)).filter(id => Number.isInteger(id) && id > 0))].sort((a, b) => a - b);
-    const rmById = new Map();
-    if (ids.length) {
-      const [rmRows] = await conn.query(
-        `SELECT rm.id, rm.name, rm.stock_qty, rm.cost_per_unit, u.symbol AS uom_symbol, u.base_type
-           FROM raw_materials rm LEFT JOIN units_of_measurement u ON u.id = rm.uom_id
-          WHERE rm.id IN (?) ORDER BY rm.id FOR UPDATE`, [ids]
-      );
-      rmRows.forEach(r => rmById.set(r.id, r));
-    }
-    const seen = new Set();
-    const lines = linesIn.map((l, i) => {
-      const rm = rmById.get(Number(l.raw_material_id));
-      if (!rm) throw fail(400, 'Choose a material on every line.', { field: 'lines', line: i });
-      if (seen.has(rm.id)) throw fail(400, `${rm.name} is listed twice. Combine the quantities on one line.`, { field: 'lines', line: i });
-      seen.add(rm.id);
-      const qty = num(l.qty);
-      if (!(qty > 0)) throw fail(400, `Enter a quantity greater than 0 for ${rm.name}.`, { field: 'lines', line: i });
-      if (rm.base_type === 'count' && !Number.isInteger(qty)) throw fail(400, `Enter a whole number of ${rm.uom_symbol} for ${rm.name}.`, { field: 'lines', line: i });
-      if (qty > 9999999999 || !decimalsOk(qty, 4)) throw fail(400, `Enter the quantity of ${rm.name} with at most 4 decimals.`, { field: 'lines', line: i });
-      const rate = num(l.rate);
-      if (!(rate > 0)) throw fail(400, `Enter a rate greater than 0 for ${rm.name}.`, { field: 'lines', line: i });
-      if (rate > MAX_MONEY || !decimalsOk(rate, 4)) throw fail(400, `Enter the rate of ${rm.name} with at most 4 decimals.`, { field: 'lines', line: i });
-      return { rm, qty, rate };
-    });
-    const costs = landedRates(lines, charges);
-    const itemsTotal = round2(costs.reduce((s, c) => s + c.lineTotal, 0));
-    if (itemsTotal > MAX_MONEY) throw fail(400, 'The purchase total is too large to record.', { field: 'lines' });
+    const rmById = await lockMaterials(conn, lineMaterialIds(linesIn));
+    const { lines, costs, itemsTotal } = readPurchaseLines(linesIn, rmById, charges);
 
     const purchaseNo = await nextPurchaseNo(conn, body.date);
     const [result] = await conn.query(
@@ -429,7 +457,7 @@ router.post('/purchases', auth, canEdit, async (req, res) => {
       await conn.query(
         `INSERT INTO rm_ledger (raw_material_id, date, reference_type, reference_id, description, qty_in, qty_out, balance_qty, unit_cost)
          VALUES (?,?,'rm_purchase',?,?,?,0,?,?)`,
-        [rm.id, body.date, headerId, `Purchase ${purchaseNo}${invoiceNo ? ` (invoice ${invoiceNo})` : ''}`, qty, balance, c.landedRate]
+        [rm.id, body.date, headerId, ledgerDescription(purchaseNo, invoiceNo), qty, balance, c.landedRate]
       );
     }
 
@@ -456,6 +484,138 @@ router.post('/purchases', auth, canEdit, async (req, res) => {
       return res.status(409).json({ message: 'Another purchase was recorded at the same moment. Save the purchase again.' });
     }
     sendError(res, err, 'The purchase could not be recorded. Try again.');
+  } finally { conn.release(); }
+});
+
+// Editing corrects a recorded purchase in place: the number stays, stock moves
+// by the difference per material, the material's stock ledger rows are
+// rewritten where they stand (so the date-ordered replay keeps their place),
+// each material's average is rebuilt from its ledger, and the supplier's
+// ledger row is corrected (moved to the new supplier if it changed). A
+// material's quantity cannot go below what batches have already taken from
+// this purchase, the same rule as delete. Batches keep the costs they froze.
+router.put('/purchases/:id', auth, canEdit, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const body = req.body || {};
+    const [[header]] = await conn.query('SELECT * FROM rm_purchase_headers WHERE id = ? FOR UPDATE', [req.params.id]);
+    if (!header) throw fail(404, 'The purchase no longer exists.');
+    const [oldLines] = await conn.query('SELECT * FROM rm_purchase_lines WHERE header_id = ? ORDER BY id', [header.id]);
+
+    // Suppliers (old and new) locked in id order.
+    const supplierId = supplierIdOf(body);
+    const [supplierRows] = await conn.query(
+      'SELECT id, name, supplier_type FROM suppliers WHERE id IN (?) ORDER BY id FOR UPDATE',
+      [[...new Set([header.supplier_id, supplierId])]]
+    );
+    const supplierById = new Map(supplierRows.map(s => [s.id, s]));
+    const supplier = supplierById.get(supplierId);
+    const oldSupplier = supplierById.get(header.supplier_id);
+    const { invoiceNo, charges, chargesNote } = readPurchaseHeader(body, supplier, header.supplier_id);
+
+    // Materials (old and new) locked in id order, in one statement.
+    const linesIn = Array.isArray(body.lines) ? body.lines : [];
+    const rmById = await lockMaterials(conn, [...oldLines.map(l => l.raw_material_id), ...lineMaterialIds(linesIn)]);
+    const { lines, costs, itemsTotal } = readPurchaseLines(linesIn, rmById, charges);
+
+    const oldQty = new Map(oldLines.map(l => [l.raw_material_id, parseFloat(l.qty)]));
+    const newQty = new Map(lines.map(l => [l.rm.id, l.qty]));
+    const touched = [...new Set([...oldQty.keys(), ...newQty.keys()])].sort((a, b) => a - b);
+
+    // Stock already used in batches stays on the purchase.
+    for (const id of touched) {
+      const rm = rmById.get(id);
+      const used = round4((oldQty.get(id) || 0) - parseFloat(rm.stock_qty));
+      if (used > 1e-9 && (newQty.get(id) || 0) < used - 1e-9) {
+        const line = lines.findIndex(l => l.rm.id === id);
+        throw fail(409, `${fmtQty(used, rm.uom_symbol)} of ${rm.name} from this purchase has already been used in batches. `
+          + `Keep at least ${fmtQty(used, rm.uom_symbol)} on the purchase.`,
+        { code: 'PURCHASE_STOCK_USED', field: 'lines', ...(line >= 0 ? { line } : {}) });
+      }
+    }
+
+    await conn.query(
+      `UPDATE rm_purchase_headers SET supplier_id=?, date=?, invoice_no=?, items_total=?, other_charges=?, charges_note=?
+        WHERE id=?`,
+      [supplier.id, body.date, invoiceNo, itemsTotal, round2(charges), chargesNote, header.id]
+    );
+    await conn.query('DELETE FROM rm_purchase_lines WHERE header_id = ?', [header.id]);
+    for (let i = 0; i < lines.length; i += 1) {
+      const { rm, qty, rate } = lines[i];
+      const c = costs[i];
+      await conn.query(
+        `INSERT INTO rm_purchase_lines (header_id, raw_material_id, qty, rate, line_total, charges_share, landed_rate)
+         VALUES (?,?,?,?,?,?,?)`,
+        [header.id, rm.id, qty, rate, c.lineTotal, c.chargesShare, c.landedRate]
+      );
+    }
+
+    const description = ledgerDescription(header.purchase_no, invoiceNo);
+    const averages = new Map();
+    for (const id of touched) {
+      const delta = round4((newQty.get(id) || 0) - (oldQty.get(id) || 0));
+      if (delta !== 0) await conn.query('UPDATE raw_materials SET stock_qty = stock_qty + ? WHERE id = ?', [delta, id]);
+      const i = lines.findIndex(l => l.rm.id === id);
+      const [[entry]] = await conn.query(
+        `SELECT id FROM rm_ledger WHERE reference_type = 'rm_purchase' AND reference_id = ? AND raw_material_id = ?`,
+        [header.id, id]
+      );
+      if (i < 0) {
+        if (entry) await conn.query('DELETE FROM rm_ledger WHERE id = ?', [entry.id]);
+      } else if (entry) {
+        await conn.query(
+          `UPDATE rm_ledger SET date=?, description=?, qty_in=?, balance_qty = balance_qty + ?, unit_cost=? WHERE id=?`,
+          [body.date, description, lines[i].qty, delta, costs[i].landedRate, entry.id]
+        );
+      } else {
+        const [[{ stock_qty: balance }]] = await conn.query('SELECT stock_qty FROM raw_materials WHERE id = ?', [id]);
+        await conn.query(
+          `INSERT INTO rm_ledger (raw_material_id, date, reference_type, reference_id, description, qty_in, qty_out, balance_qty, unit_cost)
+           VALUES (?,?,'rm_purchase',?,?,?,0,?,?)`,
+          [id, body.date, header.id, description, lines[i].qty, balance, costs[i].landedRate]
+        );
+      }
+      const average = await replayAverageRate(conn, id);
+      if (average !== null) await conn.query('UPDATE raw_materials SET cost_per_unit = ? WHERE id = ?', [average, id]);
+      averages.set(id, average === null ? parseFloat(rmById.get(id).cost_per_unit) : average);
+    }
+
+    // Supplier payable: the items only, moved to the new supplier if it changed.
+    await conn.query('UPDATE suppliers SET balance = balance - ? WHERE id = ?', [header.items_total, header.supplier_id]);
+    await conn.query('UPDATE suppliers SET balance = balance + ? WHERE id = ?', [itemsTotal, supplier.id]);
+    const [[{ balance: supplierBalance }]] = await conn.query('SELECT balance FROM suppliers WHERE id = ?', [supplier.id]);
+    const [ledgerUpdate] = await conn.query(
+      `UPDATE supplier_ledger SET supplier_id=?, date=?, invoice_no=?, description=?, dr=?, balance=?
+        WHERE reference_type = 'rm_purchase' AND reference_id = ?`,
+      [supplier.id, body.date, invoiceNo, `Raw material purchase ${header.purchase_no}`, itemsTotal, supplierBalance, header.id]
+    );
+    if (!ledgerUpdate.affectedRows) {
+      await conn.query(
+        `INSERT INTO supplier_ledger (supplier_id, date, invoice_no, description, dr, cr, balance, reference_type, reference_id)
+         VALUES (?,?,?,?,?,0,?,'rm_purchase',?)`,
+        [supplier.id, body.date, invoiceNo, `Raw material purchase ${header.purchase_no}`, itemsTotal, supplierBalance, header.id]
+      );
+    }
+
+    await conn.commit();
+    const oldItems = parseFloat(header.items_total);
+    const changes = [];
+    if (supplier.id !== header.supplier_id) changes.push(`supplier ${oldSupplier ? oldSupplier.name : header.supplier_id} to ${supplier.name}`);
+    if (dateOnly(header.date) !== body.date) changes.push(`date ${dateOnly(header.date)} to ${body.date}`);
+    if (Math.abs(oldItems - itemsTotal) > 0.005) changes.push(`items ${fmtPKR(oldItems)} to ${fmtPKR(itemsTotal)}`);
+    if (Math.abs(parseFloat(header.other_charges) - round2(charges)) > 0.005) {
+      changes.push(`other charges ${fmtPKR(header.other_charges)} to ${fmtPKR(charges)}`);
+    }
+    await logAudit(req, 'UPDATE', 'raw-materials/purchases', header.id,
+      `Edited purchase ${header.purchase_no}${changes.length ? `: ${changes.join('; ')}` : ''}; stock, average rates and supplier ledger corrected`);
+    res.json({
+      id: header.id, purchase_no: header.purchase_no, items_total: itemsTotal, other_charges: round2(charges),
+      lines: lines.map((l, i) => ({ raw_material_id: l.rm.id, landed_rate: costs[i].landedRate, purchase_rate: averages.get(l.rm.id) })),
+    });
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    sendError(res, err, 'The purchase could not be saved. Try again.');
   } finally { conn.release(); }
 });
 
