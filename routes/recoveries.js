@@ -5,6 +5,7 @@ const auth    = require('../middleware/auth');
 const { logAudit } = require('../middleware/auditLog');
 const { todayPKT, formatDatePKT, addMonthsPKT } = require('../utils/dateUtils');
 const { assertSelectableEmployee } = require('../utils/masterEmployees');
+const { fmtPKR } = require('../utils/salaryAdvances');
 
 // ─── Recovery lifecycle (post 2026-08 refactor) ────────────────────────────
 // A recovery event captures three kinds of activity against a single sale
@@ -87,6 +88,22 @@ function returnRateCap(si, cumulativeRecoveryDiscount) {
   return Math.max(0, money(paidPerUnit - perUnitRecDisc));
 }
 
+// Write per-row values for many rows of one table in a single statement:
+// `UPDATE t SET a = CASE id WHEN ? THEN ? … END, … WHERE id IN (…)`.
+// Every round trip to the database costs network latency inside an open
+// transaction (locks held meanwhile), so the recovery paths never update
+// row by row. `table` and `columns` are code constants, never user input.
+async function updateRowsById(conn, table, columns, rows) {
+  if (!rows.length) return;
+  const params = [];
+  const sets = columns.map((col) => {
+    const whens = rows.map((row) => { params.push(row.id, row[col]); return 'WHEN ? THEN ?'; });
+    return `${col} = CASE id ${whens.join(' ')} END`;
+  });
+  params.push(rows.map(row => row.id));
+  await conn.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE id IN (?)`, params);
+}
+
 // Re-prorate cumulative invoice-level discount and cash across sale_items
 // by each line's tax-inclusive total (`sale_items.total`) share of the
 // invoice. Rounding residuals land on the last line so the sum equals the
@@ -101,34 +118,29 @@ async function reprorateSaleItems(conn, saleId, saleTotalDiscount, saleTotalReco
   if (lineSum <= 0) {
     // Every line total is 0 (fully-shrunk legacy invoice). Zero out both
     // cumulatives on every line so invariants 4 and 5 hold.
-    for (const it of items) {
-      await conn.query(
-        'UPDATE sale_items SET recovery_discount=0, recovered_amount=0 WHERE id=?',
-        [it.id]
-      );
-    }
+    await conn.query(
+      'UPDATE sale_items SET recovery_discount=0, recovered_amount=0 WHERE sale_id=?',
+      [saleId]
+    );
     return;
   }
   let allocatedDisc = 0, allocatedRec = 0;
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const isLast = i === items.length - 1;
-    let discShare, recShare;
-    if (isLast) {
-      discShare = money(saleTotalDiscount - allocatedDisc);
-      recShare  = money(saleTotalRecovered - allocatedRec);
-    } else {
-      const weight = parseFloat(item.total) / lineSum;
-      discShare = money(saleTotalDiscount * weight);
-      recShare  = money(saleTotalRecovered * weight);
-      allocatedDisc += discShare;
-      allocatedRec  += recShare;
+  const shares = items.map((item, i) => {
+    if (i === items.length - 1) {
+      return {
+        id: item.id,
+        recovery_discount: money(saleTotalDiscount - allocatedDisc),
+        recovered_amount:  money(saleTotalRecovered - allocatedRec),
+      };
     }
-    await conn.query(
-      'UPDATE sale_items SET recovery_discount=?, recovered_amount=? WHERE id=?',
-      [discShare, recShare, item.id]
-    );
-  }
+    const weight = parseFloat(item.total) / lineSum;
+    const discShare = money(saleTotalDiscount * weight);
+    const recShare  = money(saleTotalRecovered * weight);
+    allocatedDisc += discShare;
+    allocatedRec  += recShare;
+    return { id: item.id, recovery_discount: discShare, recovered_amount: recShare };
+  });
+  await updateRowsById(conn, 'sale_items', ['recovery_discount', 'recovered_amount'], shares);
 }
 
 // Rebuild every sale-level and per-line cumulative for an invoice from the
@@ -150,6 +162,7 @@ async function rebuildSaleFromRecoveries(conn, saleId) {
 
   let runDisc = 0, runReturn = 0, runRecovered = 0;
   let finalNet = invoiceTotal, finalPending = invoiceTotal;
+  const snapshots = [];
   for (const r of recs) {
     runDisc      += parseFloat(r.total_discount || 0);
     runReturn    += parseFloat(r.total_return_amount || 0);
@@ -170,13 +183,11 @@ async function rebuildSaleFromRecoveries(conn, saleId) {
     // this-event-only cash cap is enforced at insert / edit time in POST /
     // and PUT /:id, before we ever reach the rebuild.
     const pending = Math.max(0, money(netCollectible - runRecovered));
-    await conn.query(
-      'UPDATE recoveries SET net_collectible=?, pending_amount=? WHERE id=?',
-      [netCollectible, pending, r.id]
-    );
+    snapshots.push({ id: r.id, net_collectible: netCollectible, pending_amount: pending });
     finalNet = netCollectible;
     finalPending = pending;
   }
+  await updateRowsById(conn, 'recoveries', ['net_collectible', 'pending_amount'], snapshots);
   runDisc      = money(runDisc);
   runReturn    = money(runReturn);
   runRecovered = money(runRecovered);
@@ -202,16 +213,18 @@ async function rebuildSaleFromRecoveries(conn, saleId) {
   );
 
   // Per-line cumulatives from re-proration + return_items sum.
+  // The correlated subquery reads only this invoice's return lines (index
+  // fk_ret_sale_item). A derived table over all of return_items took shared
+  // locks on every return in the system until commit, so any other user's
+  // return or recovery waited behind this transaction (Quick Recovery
+  // timeouts, 2026-10-15).
   await reprorateSaleItems(conn, saleId, runDisc, runRecovered);
   await conn.query(
     `UPDATE sale_items si
-        LEFT JOIN (
-          SELECT sale_item_id, COALESCE(SUM(qty_returned), 0) AS q
-            FROM return_items
-           GROUP BY sale_item_id
-        ) r ON r.sale_item_id = si.id
-       SET si.returned_qty = COALESCE(r.q, 0)
-     WHERE si.sale_id = ?`,
+        SET si.returned_qty = (SELECT COALESCE(SUM(ri.qty_returned), 0)
+                                 FROM return_items ri
+                                WHERE ri.sale_item_id = si.id)
+      WHERE si.sale_id = ?`,
     [saleId]
   );
 
@@ -544,151 +557,280 @@ router.get('/:id', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 // POST /bulk — Quick Recovery
 // ═══════════════════════════════════════════════════════════════════════════
-// Body: { date, entries: [{ invoice_no, discount }] }
+// Body: { date, entries: [{ invoice_no, discount, expected_pending? }] }
 // Each entry fully collects (remaining balance − discount) in one shot.
 //
 // Every entry is its own transaction — one failure does not roll back the
-// others. The response's per-entry `success` flag tells the UI which ones
-// went through.
+// others. The response is always 200 for a valid request; each result's
+// `success` flag and `code` tell the UI what happened to that invoice:
+//   ALREADY_RECOVERED  the invoice is settled (often by an earlier attempt of
+//                      this same save whose response never arrived), so
+//                      nothing was recorded — a retry is always safe
+//   BALANCE_CHANGED    `expected_pending` (the balance the operator saw) no
+//                      longer matches; `pending_amount` carries the new one
+//   NOT_FOUND · DISCOUNT_TOO_HIGH · NOTHING_TO_COLLECT · INVOICE_BUSY · FAILED
+//
+// Speed matters here: the client waits on this request, and every entry
+// holds its invoice and customer rows locked until it commits. Each entry
+// costs a fixed number of statements (no per-line round trips), all entries
+// share one connection, and a row locked by another user is waited for at
+// most 10 s (instead of the server's 50 s default) before the entry is
+// reported as INVOICE_BUSY. A deadlock (InnoDB detects it at once and rolls
+// this entry back) is retried after a short pause. The client sends
+// SAVE_BATCH_SIZE (10) invoices per request (QuickRecovery.jsx) so progress
+// stays visible.
+
+const BULK_MAX_ENTRIES = 500;
+const BULK_LOCK_WAIT_SECONDS = 10;
+const BULK_MAX_ATTEMPTS = 3;
+const LOCK_CONFLICT_ERRORS = new Set(['ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT']);
+const RETRYABLE_LOCK_ERRORS = new Set(['ER_LOCK_DEADLOCK']);
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+const entryError = (status, code, message, extra = {}) =>
+  Object.assign(new Error(message), { status, code, ...extra });
+
+// One Quick Recovery entry, inside the caller's open transaction.
+async function settleQuickRecoveryEntry(conn, entry, date) {
+  const invoiceNo = String(entry.invoice_no ?? '').trim();
+  const discount = money(Math.max(0, parseFloat(entry.discount) || 0));
+
+  const [sRows] = await conn.query(
+    'SELECT * FROM sales WHERE invoice_no=? FOR UPDATE',
+    [invoiceNo]
+  );
+  if (!sRows.length) {
+    throw entryError(404, 'NOT_FOUND', 'Invoice not found.');
+  }
+  const sale = sRows[0];
+  if (sale.recovery_status === 'completed') {
+    throw entryError(409, 'ALREADY_RECOVERED',
+      'The invoice is already fully recovered. Nothing was recorded.');
+  }
+
+  const priorDiscount = parseFloat(sale.total_discount || 0);
+  const priorReturn   = parseFloat(sale.total_return_amount || 0);
+  const priorRecovered= parseFloat(sale.total_recovered || 0);
+  const invoiceTotal  = parseFloat(sale.total_amount);
+
+  const maxAdditionalDisc = money(
+    invoiceTotal - priorDiscount - priorReturn - priorRecovered
+  );
+  const pendingNow = Math.max(0, maxAdditionalDisc);
+
+  // The operator confirmed an amount computed from the balance on screen.
+  // If another recovery or return changed it since, collecting "whatever is
+  // still owed" would record a different sum than the one confirmed.
+  const expected = entry.expected_pending;
+  if (expected !== undefined && expected !== null && expected !== ''
+      && Math.abs(money(expected) - pendingNow) > PAISA) {
+    throw entryError(409, 'BALANCE_CHANGED',
+      `The balance changed to ${fmtPKR(pendingNow)} after the list was loaded. Check the amount and save again.`,
+      { pending_amount: pendingNow });
+  }
+
+  if (discount > maxAdditionalDisc + PAISA) {
+    throw entryError(400, 'DISCOUNT_TOO_HIGH',
+      `The discount exceeds the invoice balance of ${fmtPKR(pendingNow)}.`);
+  }
+
+  // Quick Recovery collects whatever is still owed after the discount.
+  const netCollectible = money(invoiceTotal - priorDiscount - discount - priorReturn);
+  const recoveredAmount = Math.max(0, money(netCollectible - priorRecovered));
+
+  if (discount <= 0 && recoveredAmount <= 0) {
+    throw entryError(400, 'NOTHING_TO_COLLECT', 'Nothing is left to collect on this invoice.');
+  }
+
+  // Insert the recovery event first (per-event snapshot columns get
+  // finalized inside rebuildSaleFromRecoveries below).
+  const [ins] = await conn.query(
+    `INSERT INTO recoveries
+       (sale_id, salesman_id, date, notes, total_discount,
+        total_return_amount, net_collectible, net_collected, pending_amount)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [sale.id, sale.delivery_by || null, date, 'Quick Recovery',
+     discount, 0, netCollectible, recoveredAmount, 0]
+  );
+  const recoveryId = ins.insertId;
+
+  // Per-line discount breakdown (prorated across sale_items by
+  // tax-inclusive line total share, matching the reprorate rule).
+  if (discount > 0) {
+    const [items] = await conn.query(
+      `SELECT id, product_id, batch_no, total
+         FROM sale_items
+        WHERE sale_id=? AND total > 0
+        ORDER BY id`,
+      [sale.id]
+    );
+    const lineSum = items.reduce((s, i) => s + parseFloat(i.total), 0);
+    let allocated = 0;
+    const rows = items.map((item, i) => {
+      const share = i === items.length - 1
+        ? money(discount - allocated)
+        : money(discount * (parseFloat(item.total) / lineSum));
+      allocated += share;
+      return [recoveryId, item.id, item.product_id, item.batch_no,
+              item.total, share, money(parseFloat(item.total) - share)];
+    });
+    if (rows.length) {
+      await conn.query(
+        `INSERT INTO recovery_items
+           (recovery_id, sale_item_id, product_id, batch_no,
+            original_total, discount_given, final_amount)
+         VALUES ?`,
+        [rows]
+      );
+    }
+  }
+
+  // Balance and ledger together: one balance update for discount + cash,
+  // then both ledger rows in one insert. The discount row carries the
+  // balance after the discount only, exactly as two separate steps would.
+  await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
+    [money(discount + recoveredAmount), sale.customer_id]);
+  const [[cust]] = await conn.query(
+    'SELECT balance FROM customers WHERE id=?', [sale.customer_id]);
+  const closing = money(cust.balance);
+  const ledgerRows = [];
+  if (discount > 0) {
+    ledgerRows.push([sale.customer_id, date, sale.invoice_no,
+      `Discount on Invoice ${sale.invoice_no} (Quick Recovery)`,
+      0, discount, money(closing + recoveredAmount), 'payment', recoveryId]);
+  }
+  if (recoveredAmount > 0) {
+    ledgerRows.push([sale.customer_id, date, sale.invoice_no,
+      `Cash Collected — Invoice ${sale.invoice_no} (Quick Recovery)`,
+      0, recoveredAmount, closing, 'payment', recoveryId]);
+  }
+  await conn.query(
+    `INSERT INTO customer_ledger
+       (customer_id, date, invoice_no, description, dr, cr, balance,
+        reference_type, reference_id)
+     VALUES ?`,
+    [ledgerRows]
+  );
+
+  // Rebuild + verify integrity.
+  await rebuildSaleFromRecoveries(conn, sale.id);
+  await assertInvariants(conn, sale.id);
+
+  return { recoveryId, sale, discount, recoveredAmount };
+}
 
 router.post('/bulk', auth, async (req, res) => {
-  const { date, entries } = req.body;
-  if (!date) return res.status(400).json({ message: 'Date required' });
-  if (!Array.isArray(entries) || !entries.length) {
-    return res.status(400).json({ message: 'No invoices selected' });
+  const { date, entries } = req.body || {};
+  if (!date) return res.status(400).json({ message: 'Recovery date is required.' });
+  if (!DATE_RE.test(String(date))) {
+    return res.status(400).json({ message: 'The recovery date is not valid.' });
   }
+  if (!Array.isArray(entries) || !entries.length) {
+    return res.status(400).json({ message: 'No invoices selected.' });
+  }
+  if (entries.length > BULK_MAX_ENTRIES) {
+    return res.status(400).json({
+      message: `Select at most ${BULK_MAX_ENTRIES} invoices in one save.`,
+    });
+  }
+
+  // One connection for the whole request, with a short lock-wait cap that is
+  // put back before the connection returns to the pool. A connection that
+  // fails is destroyed and the next entry takes a fresh one.
+  let conn = null;
+  const getConn = async () => {
+    if (!conn) {
+      const c = await db.getConnection();
+      try {
+        await c.query('SET SESSION innodb_lock_wait_timeout = ?', [BULK_LOCK_WAIT_SECONDS]);
+      } catch (err) { c.destroy(); throw err; }
+      conn = c;
+    }
+    return conn;
+  };
+  const dropConn = () => { if (conn) { conn.destroy(); conn = null; } };
+  const releaseConn = async () => {
+    if (!conn) return;
+    const c = conn;
+    conn = null;
+    try {
+      await c.query('SET SESSION innodb_lock_wait_timeout = DEFAULT');
+      c.release();
+    } catch { c.destroy(); }
+  };
 
   const results = [];
-  for (const entry of entries) {
-    const invoiceNo = entry.invoice_no;
-    const discount = Math.max(0, parseFloat(entry.discount) || 0);
-    const conn = await db.getConnection();
-    await conn.beginTransaction();
-    try {
-      const [sRows] = await conn.query(
-        'SELECT * FROM sales WHERE invoice_no=? FOR UPDATE',
-        [invoiceNo]
-      );
-      if (!sRows.length) {
-        throw Object.assign(new Error('Invoice not found'), { status: 404 });
-      }
-      const sale = sRows[0];
-      if (sale.recovery_status === 'completed') {
-        throw Object.assign(new Error('Already fully recovered'), { status: 400 });
-      }
+  try {
+    for (const raw of entries) {
+      const entry = raw && typeof raw === 'object' ? raw : {};
+      const invoiceNo = String(entry.invoice_no ?? '').trim();
+      let settled = null;
+      let failure = null;
 
-      const priorDiscount = parseFloat(sale.total_discount || 0);
-      const priorReturn   = parseFloat(sale.total_return_amount || 0);
-      const priorRecovered= parseFloat(sale.total_recovered || 0);
-      const invoiceTotal  = parseFloat(sale.total_amount);
-
-      const maxAdditionalDisc = money(
-        invoiceTotal - priorDiscount - priorReturn - priorRecovered
-      );
-      if (discount > maxAdditionalDisc + PAISA) {
-        throw Object.assign(new Error(
-          `Discount exceeds remaining invoice balance (${maxAdditionalDisc.toFixed(2)})`
-        ), { status: 400 });
-      }
-
-      // Quick Recovery collects whatever is still owed after the discount.
-      const netCollectible = money(invoiceTotal - priorDiscount - discount - priorReturn);
-      const recoveredAmount = Math.max(0, money(netCollectible - priorRecovered));
-
-      if (discount <= 0 && recoveredAmount <= 0) {
-        throw Object.assign(new Error(
-          'Nothing to collect on this invoice.'
-        ), { status: 400 });
-      }
-
-      // Insert the recovery event first (per-event snapshot columns get
-      // finalized inside rebuildSaleFromRecoveries below).
-      const [ins] = await conn.query(
-        `INSERT INTO recoveries
-           (sale_id, salesman_id, date, notes, total_discount,
-            total_return_amount, net_collectible, net_collected, pending_amount)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
-        [sale.id, sale.delivery_by || null, date, 'Quick Recovery',
-         discount, 0, netCollectible, recoveredAmount, 0]
-      );
-      const recoveryId = ins.insertId;
-
-      // Per-line discount breakdown (prorated across sale_items by
-      // tax-inclusive line total share, matching the reprorate rule).
-      if (discount > 0) {
-        const [items] = await conn.query(
-          `SELECT id, product_id, batch_no, total
-             FROM sale_items
-            WHERE sale_id=? AND total > 0
-            ORDER BY id`,
-          [sale.id]
-        );
-        const lineSum = items.reduce((s, i) => s + parseFloat(i.total), 0);
-        let allocated = 0;
-        for (let i = 0; i < items.length; i++) {
-          const item = items[i];
-          const isLast = i === items.length - 1;
-          const share = isLast
-            ? money(discount - allocated)
-            : money(discount * (parseFloat(item.total) / lineSum));
-          allocated += share;
-          await conn.query(
-            `INSERT INTO recovery_items
-               (recovery_id, sale_item_id, product_id, batch_no,
-                original_total, discount_given, final_amount)
-             VALUES (?,?,?,?,?,?,?)`,
-            [recoveryId, item.id, item.product_id, item.batch_no,
-             item.total, share, money(parseFloat(item.total) - share)]
-          );
+      for (let attempt = 1; attempt <= BULK_MAX_ATTEMPTS; attempt++) {
+        let c = null;
+        try {
+          c = await getConn();
+          await c.beginTransaction();
+          settled = await settleQuickRecoveryEntry(c, entry, date);
+          await c.commit();
+          break;
+        } catch (err) {
+          if (c) {
+            try { await c.rollback(); } catch { dropConn(); }
+          }
+          if (err.fatal) dropConn();
+          if (RETRYABLE_LOCK_ERRORS.has(err.code) && attempt < BULK_MAX_ATTEMPTS) {
+            await new Promise(r => setTimeout(r, 150 * attempt + Math.floor(Math.random() * 150)));
+            continue;
+          }
+          failure = err;
+          break;
         }
-        await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
-          [discount, sale.customer_id]);
-        const [[c1]] = await conn.query(
-          'SELECT balance FROM customers WHERE id=?', [sale.customer_id]);
-        await conn.query(
-          `INSERT INTO customer_ledger
-             (customer_id, date, invoice_no, description, dr, cr, balance,
-              reference_type, reference_id)
-           VALUES (?,?,?,?,?,?,?,?,?)`,
-          [sale.customer_id, date, sale.invoice_no,
-           `Discount on Invoice ${sale.invoice_no} (Quick Recovery)`,
-           0, discount, c1.balance, 'payment', recoveryId]
-        );
       }
 
-      if (recoveredAmount > 0) {
-        await conn.query('UPDATE customers SET balance=balance-? WHERE id=?',
-          [recoveredAmount, sale.customer_id]);
-        const [[c2]] = await conn.query(
-          'SELECT balance FROM customers WHERE id=?', [sale.customer_id]);
-        await conn.query(
-          `INSERT INTO customer_ledger
-             (customer_id, date, invoice_no, description, dr, cr, balance,
-              reference_type, reference_id)
-           VALUES (?,?,?,?,?,?,?,?,?)`,
-          [sale.customer_id, date, sale.invoice_no,
-           `Cash Collected — Invoice ${sale.invoice_no} (Quick Recovery)`,
-           0, recoveredAmount, c2.balance, 'payment', recoveryId]
+      if (settled) {
+        const { recoveryId, sale, discount, recoveredAmount } = settled;
+        await logAudit(req, 'CREATE', 'recovery', recoveryId,
+          `Quick Recovery on invoice ${sale.invoice_no}: discount ${discount}, recovered ${recoveredAmount}`
         );
+        results.push({ invoice_no: invoiceNo, success: true, recovered: recoveredAmount, discount });
+        continue;
       }
 
-      // Rebuild + verify integrity.
-      await rebuildSaleFromRecoveries(conn, sale.id);
-      await assertInvariants(conn, sale.id);
-
-      await conn.commit();
-      await logAudit(req, 'CREATE', 'recovery', recoveryId,
-        `Quick Recovery on invoice ${sale.invoice_no}: discount ${discount}, recovered ${recoveredAmount}`
-      );
-      results.push({ invoice_no: invoiceNo, success: true, recovered: recoveredAmount, discount });
-    } catch (err) {
-      await conn.rollback();
-      results.push({ invoice_no: invoiceNo, success: false, message: err.message });
-    } finally { conn.release(); }
+      if (failure.code && failure.status) {
+        // A business rule from settleQuickRecoveryEntry.
+        results.push({
+          invoice_no: invoiceNo, success: false, code: failure.code, message: failure.message,
+          ...(failure.pending_amount !== undefined && { pending_amount: failure.pending_amount }),
+        });
+      } else if (LOCK_CONFLICT_ERRORS.has(failure.code)) {
+        results.push({
+          invoice_no: invoiceNo, success: false, code: 'INVOICE_BUSY',
+          message: 'Another user is updating this invoice. Nothing was recorded. Save it again.',
+        });
+      } else {
+        console.error(`[Quick Recovery] ${invoiceNo}:`, failure);
+        results.push({
+          invoice_no: invoiceNo, success: false, code: 'FAILED',
+          message: 'The recovery could not be saved. Nothing was recorded. Save it again.',
+        });
+      }
+    }
+  } catch (err) {
+    // Only reachable through a bug above; answer rather than leave the
+    // client waiting for a response that never comes.
+    console.error('[Quick Recovery] request failed:', err);
+    await releaseConn();
+    return res.status(500).json({
+      message: 'The recovery could not be completed. Refresh the list to see which invoices were saved.',
+      results,
+    });
   }
+  await releaseConn();
 
   const failed = results.filter(r => !r.success);
-  res.status(failed.length && failed.length === results.length ? 400 : 200).json({
+  res.json({
     results,
     successCount: results.length - failed.length,
     failCount: failed.length,
