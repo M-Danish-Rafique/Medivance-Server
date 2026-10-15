@@ -25,10 +25,12 @@ const normKey = (value) => String(value ?? '').toLowerCase().trim().replace(/\s+
 /** SQL twin of normKey for a column. */
 const normSql = (column) => `LOWER(TRIM(REGEXP_REPLACE(${column}, '[[:space:]]+', ' ')))`;
 
-/** Pack size label stored in products.pack_size: "200 ml", "200 ml Pouch". */
-const packLabel = (volume, symbol, packType) => {
+/** Pack size label stored in products.pack_size: number + unit ("200 ml").
+ *  The pack type is never part of it (owner 2026-10-15): it is shown on
+ *  every document beside the product name. */
+const packLabel = (volume, symbol) => {
   const n = String(Number(Math.round((Number(volume) + Number.EPSILON) * 10000) / 10000));
-  return `${n} ${symbol}${packType ? ` ${packType}` : ''}`;
+  return `${n} ${symbol}`;
 };
 
 const isDate = (value) => {

@@ -167,14 +167,16 @@ router.delete('/categories/:id', auth, canEditProducts, async (req, res) => {
 });
 
 // ── Pack types (manufactured products only) ────────────────────────────────
-// A managed list like categories. The name is printed inside pack sizes
-// ("200 ml Pouch") on invoices, so one in use can be neither renamed nor
-// deleted. Names are unique, case and extra spaces ignored.
+// A managed list like categories: an attribute of the product, used inside
+// Manufacturing only. It is never part of the pack size or the name, so it
+// never reaches an invoice (owner 2026-10-15) and can be renamed while in use;
+// the products' copy of the name (products.pack_type) is renamed with it.
+// Delete is refused while in use. Names are unique, case and extra spaces ignored.
 const PACK_TYPE_SELECT = `
   SELECT t.id, t.name, (SELECT COUNT(*) FROM products p WHERE p.pack_type_id = t.id) AS product_count
     FROM mfg_pack_types t`;
 const packTypeInUse = (t) => fail(409,
-  `${t.name} is used by ${plural(t.product_count, 'product', 'products')}, so it can't be renamed or deleted.`,
+  `${t.name} is used by ${plural(t.product_count, 'product', 'products')}. Choose another pack type on those products first.`,
   { field: 'name', code: 'PACK_TYPE_IN_USE' });
 
 async function findPackType(conn, id) {
@@ -215,18 +217,22 @@ router.post('/pack-types', auth, canEditProducts, async (req, res) => {
 });
 
 router.put('/pack-types/:id', auth, canEditProducts, async (req, res) => {
+  const conn = await db.getConnection();
   try {
-    const existing = await findPackType(db, req.params.id);
-    const name = await validatePackTypeName(db, req.body.name, existing.id);
-    if (name === existing.name) return res.json(existing);
-    if (existing.product_count > 0) throw packTypeInUse(existing);
-    await db.query('UPDATE mfg_pack_types SET name=? WHERE id=?', [name, existing.id]);
+    await conn.beginTransaction();
+    const existing = await findPackType(conn, req.params.id);
+    const name = await validatePackTypeName(conn, req.body.name, existing.id);
+    if (name === existing.name) { await conn.rollback(); return res.json(existing); }
+    await conn.query('UPDATE mfg_pack_types SET name=? WHERE id=?', [name, existing.id]);
+    await conn.query('UPDATE products SET pack_type=? WHERE pack_type_id=?', [name, existing.id]);
+    await conn.commit();
     await logAudit(req, 'UPDATE', 'manufacturing/pack-types', existing.id, `Renamed pack type "${existing.name}" to "${name}"`);
-    res.json({ id: existing.id, name, product_count: 0 });
+    res.json({ id: existing.id, name, product_count: existing.product_count });
   } catch (err) {
+    await conn.rollback().catch(() => {});
     if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ field: 'name', message: 'A pack type with this name already exists.' });
     sendError(res, err, 'The pack type could not be renamed. Try again.');
-  }
+  } finally { conn.release(); }
 });
 
 router.delete('/pack-types/:id', auth, canEditProducts, async (req, res) => {
@@ -246,9 +252,10 @@ router.delete('/pack-types/:id', auth, canEditProducts, async (req, res) => {
 // Both are rows in `products` (is_manufactured = 1), so Sale, Inventory and
 // Reports treat them like any other product; all of them read pack_size.
 //   Manufactured product: pack size = number + unit (volume, volume_uom_id, a
-//     weight or volume) plus an optional pack type from the managed list
-//     (pack_type_id; its name is copied to pack_type). pack_size is generated:
-//     "200 ml", "200 ml Pouch". Unique by name + size in base units + pack type.
+//     weight or volume); pack_size is generated from it ("200 ml"). An optional
+//     pack type from the managed list (pack_type_id; its name is copied to
+//     pack_type) is an attribute only, never part of pack_size or the name.
+//     Unique by name + size in base units (the pack type does not count).
 //   By-product: its pack size IS its unit ("kg", "pcs"): no number and no pack
 //     type (volume is kept at 1 internally). Unique by name. The unit is fixed
 //     once the by-product is in use.
@@ -341,7 +348,7 @@ async function validateProduct(conn, body, kind, excludeId) {
 
   const values = { name };
   if (kind === 'product') {
-    // Pack size = number + unit (+ optional pack type from the list).
+    // Pack size = number + unit. The pack type is stored beside it, never in it.
     const volume = num(body.volume);
     if (!(volume > 0)) throw fail(400, 'Enter the pack size.', { field: 'volume' });
     if (volume > 99999999 || !decimalsOk(volume, 3)) throw fail(400, 'Enter the pack size with at most 3 decimals.', { field: 'volume' });
@@ -350,7 +357,7 @@ async function validateProduct(conn, body, kind, excludeId) {
     if (uom.base_type === 'count' && !Number.isInteger(volume)) throw fail(400, `Enter a whole number of ${uom.symbol} for the pack size.`, { field: 'volume' });
     const packType = await resolvePackType(conn, body);
     Object.assign(values, {
-      pack_size: packLabel(volume, uom.symbol, packType?.name), pack_type: packType?.name || null, pack_type_id: packType?.id || null,
+      pack_size: packLabel(volume, uom.symbol), pack_type: packType?.name || null, pack_type_id: packType?.id || null,
       volume: round4(volume), volume_uom_id: uom.id, _base: volume * parseFloat(uom.to_base_factor), _baseType: uom.base_type,
     });
     values.category_id = await optionalRef(conn, 'product_categories', body.category_id, 'category_id', 'Choose a category from the list.');
@@ -371,17 +378,17 @@ async function validateProduct(conn, body, kind, excludeId) {
   Object.assign(values, taxFields(body));
 
   if (kind === 'product') {
-    // Unique by name + size in base units + pack type, case and extra spaces
-    // ignored, so 1 L and 1000 ml, or 1 kg and 1000 g, are one size.
+    // Unique by name + size in base units, case and extra spaces ignored, so
+    // 1 L and 1000 ml, or 1 kg and 1000 g, are one size. The pack type does
+    // not make a second product: documents would show the two alike.
     const [same] = await conn.query(
-      `SELECT p.id, p.name, p.pack_size, p.pack_type, p.volume, u.to_base_factor, u.base_type
+      `SELECT p.id, p.name, p.pack_size, p.volume, u.to_base_factor, u.base_type
          FROM products p LEFT JOIN units_of_measurement u ON u.id = p.volume_uom_id
         WHERE p.is_manufactured = 1 AND p.is_by_product = 0 AND ${normSql('p.name')} = ? AND p.id <> ?`,
       [normKey(values.name), excludeId || 0]
     );
     const dup = same.find(r => r.base_type === values._baseType
-      && Math.abs(num(r.volume) * num(r.to_base_factor) - values._base) < 1e-6
-      && normKey(r.pack_type || '') === normKey(values.pack_type || ''));
+      && Math.abs(num(r.volume) * num(r.to_base_factor) - values._base) < 1e-6);
     if (dup) throw fail(409, `${dup.name} — ${dup.pack_size} already exists.`, { field: 'name' });
   } else {
     // One by-product per name, case and extra spaces ignored.
