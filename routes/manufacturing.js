@@ -37,6 +37,8 @@ const REQUIRED_SCHEMA = [
   { table: 'mfg_batch_byproducts', column: 'sale_rate', script: 'mfg_byproduct_sale_rate.sql' },
   { table: 'mfg_pack_types', column: 'name', script: 'mfg_pack_types.sql' },
   { table: 'products', column: 'pack_type_id', script: 'mfg_pack_types.sql' },
+  { table: 'mfg_formulas', column: 'category_key', script: 'mfg_formulas.sql' },
+  { table: 'mfg_pack_packaging', column: 'per_units', script: 'mfg_formulas.sql' },
 ];
 let schemaReady = false;
 async function requireSchema(req, res, next) {
@@ -259,7 +261,7 @@ router.delete('/pack-types/:id', auth, canEditProducts, async (req, res) => {
 //   By-product: its pack size IS its unit ("kg", "pcs"): no number and no pack
 //     type (volume is kept at 1 internally). Unique by name. The unit is fixed
 //     once the by-product is in use.
-const PRODUCT_SELECT = `
+const productSelect = (extraColumns = '') => `
   SELECT p.id, p.name, p.pack_size, p.pack_type, p.pack_type_id, p.volume, p.volume_uom_id,
          u.symbol AS vol_uom_symbol, u.base_type AS vol_uom_base_type, u.to_base_factor AS vol_uom_factor,
          p.purchase_rate, p.show_purchase_rate, p.sale_rate, p.retail_price,
@@ -269,18 +271,26 @@ const PRODUCT_SELECT = `
            + (SELECT COUNT(DISTINCT bb.batch_id) FROM mfg_batch_byproducts bb WHERE bb.product_id = p.id) AS batch_count,
          (SELECT COUNT(*) FROM inventory i WHERE i.product_id = p.id) AS inventory_count,
          (SELECT COUNT(*) FROM sale_items si WHERE si.product_id = p.id) AS sale_count,
-         (SELECT COUNT(*) FROM purchase_items pi WHERE pi.product_id = p.id) AS purchase_count
+         (SELECT COUNT(*) FROM purchase_items pi WHERE pi.product_id = p.id) AS purchase_count${extraColumns}
     FROM products p
     LEFT JOIN units_of_measurement u ON u.id = p.volume_uom_id
     LEFT JOIN companies c ON c.id = p.company_id
     LEFT JOIN product_categories pc ON pc.id = p.category_id`;
+const PRODUCT_SELECT = productSelect();
+// The products list also says how far each pack size's formula is set up:
+// the group's raw materials and this pack size's own packaging.
+const FORMULA_STATE_COLUMNS = `,
+         EXISTS (SELECT 1 FROM mfg_formulas f JOIN mfg_formula_materials fm ON fm.formula_id = f.id
+                  WHERE f.product_key = ${normSql('p.name')} AND f.category_key = COALESCE(p.category_id, 0)) AS has_formula_materials,
+         EXISTS (SELECT 1 FROM mfg_pack_packaging pp WHERE pp.product_id = p.id) AS has_packaging`;
 
 async function shapeProducts(req, rows) {
   const canView = await canViewPurchaseRate(req, db);
   return rows.map(r => {
     const usage = productUsage(r);
+    const { has_formula_materials: hasMaterials, has_packaging: hasPackaging, ...rest } = r;
     return {
-      ...r,
+      ...rest,
       batch_count: Number(r.batch_count),
       inventory_count: Number(r.inventory_count),
       sale_count: Number(r.sale_count),
@@ -288,6 +298,13 @@ async function shapeProducts(req, rows) {
       in_use: !!usage,
       usage,
       purchase_rate: canView && Number(r.show_purchase_rate ?? 1) ? r.purchase_rate : null,
+      ...(hasMaterials !== undefined && {
+        formula_state: Number(hasMaterials) && Number(hasPackaging) ? 'complete'
+          : Number(hasMaterials) || Number(hasPackaging) ? 'partial' : 'none',
+        // What a partial formula still lacks (the products list explains it).
+        formula_missing: Number(hasMaterials) && !Number(hasPackaging) ? 'packaging'
+          : !Number(hasMaterials) && Number(hasPackaging) ? 'raw_materials' : null,
+      }),
     };
   });
 }
@@ -417,7 +434,8 @@ function productRoutes(path, kind) {
   router.get(path, auth, canRead, async (req, res) => {
     try {
       const [rows] = await db.query(
-        `${PRODUCT_SELECT} WHERE p.is_manufactured = 1 AND p.is_by_product = ? ORDER BY p.name, p.volume * COALESCE(u.to_base_factor, 1)`, [isBy]
+        `${isBy ? PRODUCT_SELECT : productSelect(FORMULA_STATE_COLUMNS)}
+          WHERE p.is_manufactured = 1 AND p.is_by_product = ? ORDER BY p.name, p.volume * COALESCE(u.to_base_factor, 1)`, [isBy]
       );
       res.json(await shapeProducts(req, rows));
     } catch (err) { sendError(res, err, `The ${noun}s could not be loaded.`); }
@@ -441,14 +459,18 @@ function productRoutes(path, kind) {
     }
   });
 
+  // One transaction: a product that leaves its group (new name or category)
+  // takes the group's formula along when no pack size is left behind.
   router.put(`${path}/:id`, auth, canEditProducts, async (req, res) => {
+    const conn = await db.getConnection();
     try {
-      const [rows] = await db.query(
-        `${PRODUCT_SELECT} WHERE p.id = ? AND p.is_manufactured = 1 AND p.is_by_product = ?`, [req.params.id, isBy]
+      await conn.beginTransaction();
+      const [rows] = await conn.query(
+        `${PRODUCT_SELECT} WHERE p.id = ? AND p.is_manufactured = 1 AND p.is_by_product = ? FOR UPDATE OF p`, [req.params.id, isBy]
       );
       if (!rows.length) throw fail(404, `The ${noun} no longer exists.`);
       const current = rows[0];
-      const v = await validateProduct(db, req.body, kind, current.id);
+      const v = await validateProduct(conn, req.body, kind, current.id);
       // Stock and batch quantities of a by-product count its unit, so the unit
       // is fixed once in use, and so is the stored label (one the unit-only
       // migration could not convert, such as "25 kg Bag", keeps its meaning).
@@ -465,35 +487,320 @@ function productRoutes(path, kind) {
       // A manufactured product's purchase rate is its latest batch cost, set when a
       // batch is sent to inventory; a by-product's is entered here.
       if (kind === 'by_product') { fields.push('purchase_rate=?'); params.push(v.purchase_rate); }
-      await db.query(`UPDATE products SET ${fields.join(', ')} WHERE id=?`, [...params, current.id]);
+      await conn.query(`UPDATE products SET ${fields.join(', ')} WHERE id=?`, [...params, current.id]);
+      if (kind === 'product') await followGroupFormula(conn, current, v);
+      await conn.commit();
       await logAudit(req, 'UPDATE', 'manufacturing/products', current.id, `Updated ${noun} "${v.name} — ${v.pack_size}"`);
       res.json({ id: current.id, ...v });
     } catch (err) {
+      await conn.rollback().catch(() => {});
       if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ field: 'name', message: 'A product with this name and pack size already exists.' });
       sendError(res, err, `The ${noun} could not be saved. Try again.`);
-    }
+    } finally { conn.release(); }
   });
 
+  // Its packaging goes with it (ON DELETE CASCADE); the group's formula goes
+  // with the last pack size.
   router.delete(`${path}/:id`, auth, canEditProducts, async (req, res) => {
+    const conn = await db.getConnection();
     try {
-      const [rows] = await db.query(
-        `${PRODUCT_SELECT} WHERE p.id = ? AND p.is_manufactured = 1 AND p.is_by_product = ?`, [req.params.id, isBy]
+      await conn.beginTransaction();
+      const [rows] = await conn.query(
+        `${PRODUCT_SELECT} WHERE p.id = ? AND p.is_manufactured = 1 AND p.is_by_product = ? FOR UPDATE OF p`, [req.params.id, isBy]
       );
       if (!rows.length) throw fail(404, `The ${noun} no longer exists.`);
       const usage = productUsage(rows[0]);
       if (usage) throw fail(409, usage, { code: 'PRODUCT_IN_USE' });
-      await db.query('DELETE FROM products WHERE id=?', [rows[0].id]);
+      await conn.query('DELETE FROM products WHERE id=?', [rows[0].id]);
+      if (kind === 'product') await followGroupFormula(conn, rows[0], null);
+      await conn.commit();
       await logAudit(req, 'DELETE', 'manufacturing/products', rows[0].id, `Deleted ${noun} "${rows[0].name} — ${rows[0].pack_size}"`);
       res.json({ message: 'Deleted.' });
     } catch (err) {
+      await conn.rollback().catch(() => {});
       if (err.code === 'ER_ROW_IS_REFERENCED_2') return res.status(409).json({ message: 'The record is in use and cannot be deleted.' });
       sendError(res, err, `The ${noun} could not be deleted. Try again.`);
-    }
+    } finally { conn.release(); }
   });
 }
 
 productRoutes('/products', 'product');
 productRoutes('/by-products', 'by_product');
+
+// ── Product formulas ───────────────────────────────────────────────────────
+// The default raw materials of a product group (same name + category; there
+// is no parent product row) for a reference output ("for 100 L"), and the
+// default packaging of each pack size ("1 carton for every 24 units"). The
+// batch editor copies them into a new batch's form; batches never read these
+// tables, so a formula change never alters a batch or a draft.
+//   mfg_formulas           one per group, keyed by product_key (normKey of the
+//                          name) + category_key (NULL category = 0)
+//   mfg_formula_materials  raw materials per ref_qty
+//   mfg_pack_packaging     packaging per pack size (products.id)
+// Saves are guarded by the group's stamp (the latest updated_at of the formula
+// and its packaging): a save made against an older stamp is refused with 409.
+const MAX_FORMULA_QTY = 99999999;
+const MAX_FORMULA_LINES = 100;
+const MAX_PACK_COUNT = 999999;
+const stampSql = (column) => `DATE_FORMAT(${column}, '%Y-%m-%d %H:%i:%s.%f')`;
+const shortStamp = (stamp) => (stamp ? String(stamp).slice(0, 23) : null);
+
+/** The group of a manufactured product (not a by-product): every pack size
+ *  with the same name and category, smallest first. `lock` holds the rows,
+ *  so two saves of one group run one after the other. */
+async function loadProductGroup(conn, productId, { lock } = {}) {
+  const [[product]] = await conn.query(
+    'SELECT id, name, category_id FROM products WHERE id = ? AND is_manufactured = 1 AND is_by_product = 0', [productId]
+  );
+  if (!product) throw fail(404, 'This product no longer exists.');
+  const [packs] = await conn.query(
+    `SELECT p.id AS product_id, p.name, p.pack_size, p.pack_type, p.volume, p.volume_uom_id AS vol_uom_id,
+            u.symbol AS vol_uom_symbol, u.base_type AS vol_uom_base_type, u.to_base_factor AS vol_uom_factor
+       FROM products p LEFT JOIN units_of_measurement u ON u.id = p.volume_uom_id
+      WHERE p.is_manufactured = 1 AND p.is_by_product = 0 AND ${normSql('p.name')} = ? AND p.category_id <=> ?
+      ORDER BY p.volume * COALESCE(u.to_base_factor, 1), p.id${lock ? ' FOR UPDATE OF p' : ''}`,
+    [normKey(product.name), product.category_id]
+  );
+  return { key: normKey(product.name), name: product.name, category_id: product.category_id ?? null, packs };
+}
+
+/** GET shape of a group's formula. */
+async function readFormula(conn, group) {
+  const [[category]] = group.category_id
+    ? await conn.query('SELECT name FROM product_categories WHERE id = ?', [group.category_id])
+    : [[null]];
+  const [[formula]] = await conn.query(
+    `SELECT f.id, f.ref_qty, f.ref_uom_id, ${stampSql('f.updated_at')} AS stamp, f.updated_by, u.full_name AS updated_by_name
+       FROM mfg_formulas f LEFT JOIN users u ON u.id = f.updated_by
+      WHERE f.product_key = ? AND f.category_key = ?`, [group.key, group.category_id || 0]
+  );
+  const [materials] = formula
+    ? await conn.query('SELECT raw_material_id, qty FROM mfg_formula_materials WHERE formula_id = ? ORDER BY sort_order, id', [formula.id])
+    : [[]];
+  const ids = group.packs.map(p => p.product_id);
+  const [packaging] = ids.length
+    ? await conn.query(
+      `SELECT pp.product_id, pp.raw_material_id, pp.qty, pp.per_units, ${stampSql('pp.updated_at')} AS stamp, pp.updated_by,
+              u.full_name AS updated_by_name
+         FROM mfg_pack_packaging pp LEFT JOIN users u ON u.id = pp.updated_by
+        WHERE pp.product_id IN (?) ORDER BY pp.sort_order, pp.id`, [ids])
+    : [[]];
+  // The group's stamp: whichever part was saved last.
+  let stamp = formula?.stamp || null;
+  let by = formula?.updated_by_name || null;
+  let byId = formula?.updated_by || null;
+  packaging.forEach(x => {
+    if (!stamp || x.stamp > stamp) { stamp = x.stamp; by = x.updated_by_name; byId = x.updated_by; }
+  });
+  return {
+    product_name: group.name,
+    category_id: group.category_id,
+    category_name: category?.name || null,
+    updated_at: shortStamp(stamp),
+    updated_by_name: stamp ? by : null,
+    updated_by_id: stamp ? byId : null,
+    formula: formula ? {
+      ref_qty: num(formula.ref_qty),
+      ref_uom_id: formula.ref_uom_id,
+      materials: materials.map(m => ({ raw_material_id: m.raw_material_id, qty: num(m.qty) })),
+    } : null,
+    packs: group.packs.map(p => ({
+      product_id: p.product_id,
+      pack_size: p.pack_size,
+      pack_type: p.pack_type || null,
+      volume: num(p.volume),
+      vol_uom_id: p.vol_uom_id,
+      vol_uom_symbol: p.vol_uom_symbol,
+      vol_uom_base_type: p.vol_uom_base_type,
+      vol_uom_factor: num(p.vol_uom_factor),
+      packaging: packaging.filter(x => x.product_id === p.product_id)
+        .map(x => ({ raw_material_id: x.raw_material_id, qty: Number(x.qty), per_units: Number(x.per_units) })),
+    })),
+  };
+}
+
+/** The body of PUT …/formula, checked as the formula page checks it. Fully
+ *  blank lines are dropped. Returns { ref, materials, packs }. */
+async function validateFormula(conn, group, body) {
+  const blankLine = (x) => blankValue(x?.raw_material_id) && blankValue(x?.qty);
+  const materialLines = (Array.isArray(body.formula?.materials) ? body.formula.materials : []).filter(x => !blankLine(x));
+  const packBodies = Array.isArray(body.packs) ? body.packs : [];
+  const ids = [...new Set([
+    ...materialLines.map(x => Number(x.raw_material_id)),
+    ...packBodies.flatMap(p => (Array.isArray(p.packaging) ? p.packaging : []).map(x => Number(x.raw_material_id))),
+  ].filter(Boolean))];
+  const [rows] = ids.length
+    ? await conn.query(
+      `SELECT rm.id, rm.name, rm.material_type, u.symbol AS uom_symbol, u.base_type
+         FROM raw_materials rm LEFT JOIN units_of_measurement u ON u.id = rm.uom_id WHERE rm.id IN (?)`, [ids])
+    : [[]];
+  const byId = new Map(rows.map(r => [r.id, r]));
+
+  if (materialLines.length > MAX_FORMULA_LINES) throw fail(400, `A formula can hold at most ${MAX_FORMULA_LINES} raw materials.`, { field: 'materials' });
+  const seen = new Set();
+  const materials = materialLines.map((x, line) => {
+    const m = byId.get(Number(x.raw_material_id));
+    if (!m) throw fail(400, 'Choose a raw material on every line.', { field: 'materials', line });
+    if (m.material_type !== 'raw_material') throw fail(400, `${m.name} is packaging. Add it under Packaging.`, { field: 'materials', line });
+    if (seen.has(m.id)) throw fail(400, `${m.name} is listed twice. Keep one line.`, { field: 'materials', line });
+    seen.add(m.id);
+    const qty = num(x.qty);
+    if (!(qty > 0) || qty > MAX_FORMULA_QTY) throw fail(400, `Enter a quantity for ${m.name}.`, { field: 'materials', line });
+    if (m.base_type === 'count' && !Number.isInteger(qty)) throw fail(400, `Enter a whole number of ${m.uom_symbol} for ${m.name}.`, { field: 'materials', line });
+    if (!decimalsOk(qty, 3)) throw fail(400, `Enter the quantity of ${m.name} with at most 3 decimals.`, { field: 'materials', line });
+    return { raw_material_id: m.id, qty: round4(qty) };
+  });
+
+  let ref = null;
+  if (materials.length) {
+    const qty = num(body.formula?.ref_qty);
+    if (!(qty > 0) || qty > MAX_FORMULA_QTY) throw fail(400, 'Enter the output these quantities are for.', { field: 'ref_qty' });
+    if (!decimalsOk(qty, 3)) throw fail(400, 'Enter the output with at most 3 decimals.', { field: 'ref_qty' });
+    const uom = await getUom(conn, body.formula?.ref_uom_id);
+    if (!uom) throw fail(400, 'Choose the unit of the output.', { field: 'ref_uom_id' });
+    const types = new Set(group.packs.map(p => p.vol_uom_base_type));
+    if (!types.has(uom.base_type)) throw fail(400, `${group.name} cannot be filled from an output measured in ${uom.symbol}.`, { field: 'ref_uom_id' });
+    if (uom.base_type === 'count' && !Number.isInteger(qty)) throw fail(400, `Enter a whole number of ${uom.symbol} for the output.`, { field: 'ref_qty' });
+    ref = { qty: round4(qty), uom_id: uom.id, symbol: uom.symbol };
+  }
+
+  const packById = new Map(group.packs.map(p => [p.product_id, p]));
+  const seenPacks = new Set();
+  const packs = packBodies.map(pb => {
+    const pack = packById.get(Number(pb.product_id));
+    if (!pack) throw fail(400, 'A pack size on this formula no longer belongs to the product. Reload the formula.', { field: 'packs' });
+    if (seenPacks.has(pack.product_id)) throw fail(400, `${pack.pack_size} is listed twice.`, { field: 'packs' });
+    seenPacks.add(pack.product_id);
+    const lines = (Array.isArray(pb.packaging) ? pb.packaging : []).filter(x => !blankLine(x));
+    if (lines.length > MAX_FORMULA_LINES) throw fail(400, `${pack.pack_size} can hold at most ${MAX_FORMULA_LINES} packaging materials.`, { field: 'packs' });
+    const seenMat = new Set();
+    return {
+      product_id: pack.product_id,
+      packaging: lines.map((x, line) => {
+        const m = byId.get(Number(x.raw_material_id));
+        if (!m) throw fail(400, `Choose the packaging material on every line of ${pack.pack_size}.`, { field: 'packs', line });
+        if (m.material_type !== 'packaging_material') throw fail(400, `${m.name} is a raw material. Add it under Raw materials.`, { field: 'packs', line });
+        if (seenMat.has(m.id)) throw fail(400, `${m.name} is listed twice for ${pack.pack_size}. Keep one line.`, { field: 'packs', line });
+        seenMat.add(m.id);
+        const qty = num(x.qty);
+        const per = blankValue(x.per_units) ? 1 : num(x.per_units);
+        if (!Number.isInteger(qty) || qty < 1 || qty > MAX_PACK_COUNT) throw fail(400, `Enter a whole number of pcs of ${m.name} for ${pack.pack_size}.`, { field: 'packs', line });
+        if (!Number.isInteger(per) || per < 1 || per > MAX_PACK_COUNT) throw fail(400, `Enter a whole number of units for ${m.name} on ${pack.pack_size}.`, { field: 'packs', line });
+        return { raw_material_id: m.id, qty, per_units: per };
+      }),
+    };
+  });
+  return { ref, materials, packs };
+}
+
+/** After a pack size's name or category changed (`after`) or it was deleted
+ *  (`after` null): when no pack size is left under the old name + category,
+ *  the formula moves to the new group, or is deleted when the new group
+ *  already has one (or the product was deleted). Same transaction. */
+async function followGroupFormula(conn, before, after) {
+  const oldKey = normKey(before.name);
+  const oldCategory = before.category_id ?? null;
+  const [[old]] = await conn.query(
+    'SELECT id FROM mfg_formulas WHERE product_key = ? AND category_key = ? FOR UPDATE', [oldKey, oldCategory || 0]
+  );
+  if (!old) return;
+  const newKey = after ? normKey(after.name) : null;
+  const newCategory = after ? after.category_id ?? null : null;
+  if (after && newKey === oldKey && Number(newCategory || 0) === Number(oldCategory || 0)) {
+    await conn.query('UPDATE mfg_formulas SET product_name = ? WHERE id = ?', [after.name, old.id]);
+    return;
+  }
+  const [[{ left }]] = await conn.query(
+    `SELECT COUNT(*) AS \`left\` FROM products
+      WHERE is_manufactured = 1 AND is_by_product = 0 AND ${normSql('name')} = ? AND category_id <=> ?`, [oldKey, oldCategory]
+  );
+  if (Number(left) > 0) return;
+  const [[taken]] = after
+    ? await conn.query('SELECT id FROM mfg_formulas WHERE product_key = ? AND category_key = ? FOR UPDATE', [newKey, newCategory || 0])
+    : [[null]];
+  if (!after || taken) {
+    await conn.query('DELETE FROM mfg_formulas WHERE id = ?', [old.id]);
+    return;
+  }
+  await conn.query('UPDATE mfg_formulas SET product_name = ?, product_key = ?, category_id = ? WHERE id = ?',
+    [after.name, newKey, newCategory, old.id]);
+}
+
+router.get('/products/:id/formula', auth, canRead, async (req, res) => {
+  try {
+    const group = await loadProductGroup(db, req.params.id);
+    res.json(await readFormula(db, group));
+  } catch (err) { sendError(res, err, 'The formula could not be loaded.'); }
+});
+
+// Replaces the formula and every listed pack size's packaging. With no raw
+// materials the formula row is removed; packaging can still be saved.
+router.put('/products/:id/formula', auth, canEditProducts, async (req, res) => {
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const group = await loadProductGroup(conn, req.params.id, { lock: true });
+    const current = await readFormula(conn, group);
+    const expected = shortStamp(req.body?.expected_updated_at || null);
+    if (current.updated_at !== expected) {
+      await conn.rollback();
+      return res.status(409).json({
+        code: 'FORMULA_CHANGED',
+        message: `${current.updated_by_name || 'Another user'} changed this formula. Reload to see their version.`,
+        updated_by_name: current.updated_by_name,
+        updated_by_id: current.updated_by_id,
+        updated_at: current.updated_at,
+      });
+    }
+    const v = await validateFormula(conn, group, req.body || {});
+    const userId = req.user?.id || null;
+    const [[existing]] = await conn.query(
+      'SELECT id FROM mfg_formulas WHERE product_key = ? AND category_key = ? FOR UPDATE', [group.key, group.category_id || 0]
+    );
+    if (v.materials.length) {
+      let formulaId = existing?.id;
+      if (formulaId) {
+        await conn.query(
+          'UPDATE mfg_formulas SET product_name = ?, ref_qty = ?, ref_uom_id = ?, updated_by = ?, updated_at = NOW(3) WHERE id = ?',
+          [group.name, v.ref.qty, v.ref.uom_id, userId, formulaId]
+        );
+        await conn.query('DELETE FROM mfg_formula_materials WHERE formula_id = ?', [formulaId]);
+      } else {
+        const [result] = await conn.query(
+          `INSERT INTO mfg_formulas (product_name, product_key, category_id, ref_qty, ref_uom_id, created_by, updated_by, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,NOW(3),NOW(3))`,
+          [group.name, group.key, group.category_id, v.ref.qty, v.ref.uom_id, userId, userId]
+        );
+        formulaId = result.insertId;
+      }
+      await conn.query(
+        'INSERT INTO mfg_formula_materials (formula_id, raw_material_id, qty, sort_order) VALUES ?',
+        [v.materials.map((m, i) => [formulaId, m.raw_material_id, m.qty, i])]
+      );
+    } else if (existing) {
+      await conn.query('DELETE FROM mfg_formulas WHERE id = ?', [existing.id]);
+    }
+    for (const pack of v.packs) {
+      await conn.query('DELETE FROM mfg_pack_packaging WHERE product_id = ?', [pack.product_id]);
+      if (pack.packaging.length) {
+        await conn.query(
+          `INSERT INTO mfg_pack_packaging (product_id, raw_material_id, qty, per_units, sort_order, updated_by, updated_at)
+           VALUES ${pack.packaging.map(() => '(?,?,?,?,?,?,NOW(3))').join(',')}`,
+          pack.packaging.flatMap((x, i) => [pack.product_id, x.raw_material_id, x.qty, x.per_units, i, userId])
+        );
+      }
+    }
+    await conn.commit();
+    const withPackaging = v.packs.filter(p => p.packaging.length).length;
+    await logAudit(req, 'UPDATE', 'manufacturing/formulas', group.packs[0]?.product_id || null,
+      `Saved the formula of ${group.name}: ${plural(v.materials.length, 'raw material', 'raw materials')}`
+      + `${v.ref ? ` for ${fmtQty(v.ref.qty, v.ref.symbol)}` : ''}; packaging for ${plural(withPackaging, 'pack size', 'pack sizes')}`);
+    res.json(await readFormula(db, await loadProductGroup(db, req.params.id)));
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    sendError(res, err, 'The formula could not be saved. Try again.');
+  } finally { conn.release(); }
+});
 
 // ── Batches ────────────────────────────────────────────────────────────────
 const batchPrefix = (date) => {

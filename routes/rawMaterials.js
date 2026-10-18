@@ -40,13 +40,15 @@ async function uomUsage(conn, id) {
             (SELECT COUNT(DISTINCT batch_id) FROM (
                SELECT id AS batch_id FROM mfg_batches WHERE volume_uom_id = ?
                UNION ALL SELECT batch_id FROM mfg_batch_packs WHERE pack_volume_uom_id = ?
-             ) t) AS batches`,
-    [id, id, id, id, id]
+             ) t) AS batches,
+            (SELECT COUNT(*) FROM mfg_formulas WHERE ref_uom_id = ?) AS formulas`,
+    [id, id, id, id, id, id]
   );
   const parts = [];
   if (Number(r.products)) parts.push(plural(r.products, 'product', 'products'));
   if (Number(r.materials)) parts.push(plural(r.materials, 'raw material', 'raw materials'));
   if (Number(r.batches)) parts.push(plural(r.batches, 'batch', 'batches'));
+  if (Number(r.formulas)) parts.push(plural(r.formulas, 'formula', 'formulas'));
   return parts.length ? `Used by ${joinAnd(parts)}.` : null;
 }
 
@@ -157,7 +159,14 @@ const MATERIAL_SELECT = `
             UNION ALL
             SELECT bp.batch_id FROM mfg_batch_pack_materials pm
               JOIN mfg_batch_packs bp ON bp.id = pm.pack_id WHERE pm.raw_material_id = rm.id
-          ) t) AS batch_count
+          ) t) AS batch_count,
+         (SELECT GROUP_CONCAT(DISTINCT t.name ORDER BY t.name SEPARATOR '\n') FROM (
+            SELECT f.product_name AS name FROM mfg_formula_materials fm
+              JOIN mfg_formulas f ON f.id = fm.formula_id WHERE fm.raw_material_id = rm.id
+            UNION
+            SELECT p.name FROM mfg_pack_packaging pp
+              JOIN products p ON p.id = pp.product_id WHERE pp.raw_material_id = rm.id
+          ) t) AS formula_products
     FROM raw_materials rm
     LEFT JOIN units_of_measurement u ON u.id = rm.uom_id`;
 
@@ -168,11 +177,21 @@ function materialUsage(row) {
   return parts.length ? `Used in ${joinAnd(parts)}.` : null;
 }
 
+/** "Used in the KHALIS Hair Oil formula. Remove it there first." A material in
+ *  a product formula (raw materials or a pack size's packaging) cannot be
+ *  deleted, and keeps its type and unit, which the formula's quantities count in. */
+const formulaUsage = (names) => (names.length
+  ? `Used in the ${joinAnd(names)} ${names.length === 1 ? 'formula' : 'formulas'}. Remove it there first.`
+  : null);
+
 const shapeMaterial = (r) => {
   const usage = materialUsage(r);
+  const { formula_products: formulaProducts, ...rest } = r;
+  const formulaNames = formulaProducts ? String(formulaProducts).split('\n') : [];
   return {
-    ...r, purchase_count: Number(r.purchase_count), batch_count: Number(r.batch_count),
+    ...rest, purchase_count: Number(r.purchase_count), batch_count: Number(r.batch_count),
     last_purchase_date: dateOnly(r.last_purchase_date), in_use: !!usage, usage,
+    formula_names: formulaNames, formula_usage: formulaUsage(formulaNames),
   };
 };
 
@@ -257,6 +276,12 @@ router.put('/:id', auth, canEdit, async (req, res) => {
     if (current.in_use && Number(v.uom_id) !== Number(current.uom_id)) {
       throw fail(409, 'The unit cannot change once the material has purchases or batches.', { field: 'uom_id' });
     }
+    if (current.formula_usage && v.material_type !== current.material_type) {
+      throw fail(409, `The type cannot change while the material is in the ${joinAnd(current.formula_names)} ${current.formula_names.length === 1 ? 'formula' : 'formulas'}.`, { field: 'material_type' });
+    }
+    if (current.formula_usage && Number(v.uom_id) !== Number(current.uom_id)) {
+      throw fail(409, `The unit cannot change while the material is in the ${joinAnd(current.formula_names)} ${current.formula_names.length === 1 ? 'formula' : 'formulas'}.`, { field: 'uom_id' });
+    }
     await db.query('UPDATE raw_materials SET name=?, material_type=?, uom_id=?, cost_per_unit=? WHERE id=?',
       [v.name, v.material_type, v.uom_id, v.purchase_rate, current.id]);
     const rateNote = Math.abs(parseFloat(current.purchase_rate) - v.purchase_rate) > 1e-9
@@ -275,6 +300,7 @@ router.delete('/:id', auth, canEdit, async (req, res) => {
     if (!rows.length) throw fail(404, 'The material no longer exists.');
     const current = shapeMaterial(rows[0]);
     if (current.in_use) throw fail(409, current.usage, { code: 'MATERIAL_IN_USE' });
+    if (current.formula_usage) throw fail(409, current.formula_usage, { code: 'MATERIAL_IN_FORMULA' });
     await db.query('DELETE FROM rm_ledger WHERE raw_material_id = ?', [current.id]);
     await db.query('DELETE FROM raw_materials WHERE id = ?', [current.id]);
     await logAudit(req, 'DELETE', 'raw-materials', current.id, `Deleted material "${current.name}"`);
