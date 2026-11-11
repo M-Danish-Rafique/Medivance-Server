@@ -31,6 +31,8 @@ const KNOWN_FLAGS = new Set([
   'perm_mfg_raw_materials',
   'perm_mfg_batches',
   'perm_mfg_yields',
+  // The assets register lists what the organization owns and what it cost.
+  'perm_assets',
 ]);
 
 function buildGate(flags, moduleLabel) {

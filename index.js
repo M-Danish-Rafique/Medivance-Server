@@ -43,6 +43,8 @@ app.use('/api/recoveries', require('./routes/recoveries'));
 app.use('/api/raw-materials', require('./routes/rawMaterials'));
 app.use('/api/manufacturing', require('./routes/manufacturing'));
 app.use('/api/tax-ledger', require('./routes/taxLedger'));
+// Gated on perm_assets server-side (middleware/requirePermission).
+app.use('/api/assets', require('./routes/assets'));
 // Workforce Management (HR & Payroll). These routers enforce their own
 // perm_hr_* flags server-side via middleware/requirePermission, unlike the
 // older modules where the flags are client-side only.
