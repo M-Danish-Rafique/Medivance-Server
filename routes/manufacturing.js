@@ -260,7 +260,7 @@ router.delete('/pack-types/:id', auth, canEditProducts, async (req, res) => {
 //     Unique by name + size in base units (the pack type does not count).
 //   By-product: its pack size IS its unit ("kg", "pcs"): no number and no pack
 //     type (volume is kept at 1 internally). Unique by name. The unit is fixed
-//     once the by-product is in use.
+//     once the by-product is in use. It has one rate (byProductRetail below).
 const productSelect = (extraColumns = '') => `
   SELECT p.id, p.name, p.pack_size, p.pack_type, p.pack_type_id, p.volume, p.volume_uom_id,
          u.symbol AS vol_uom_symbol, u.base_type AS vol_uom_base_type, u.to_base_factor AS vol_uom_factor,
@@ -277,6 +277,16 @@ const productSelect = (extraColumns = '') => `
     LEFT JOIN companies c ON c.id = p.company_id
     LEFT JOIN product_categories pc ON pc.id = p.category_id`;
 const PRODUCT_SELECT = productSelect();
+
+// A by-product has one rate, entered on the By-products tab and per batch:
+// purchase rate = sale rate. All of its value lowers the cost of the batch
+// that gives it, and selling it makes no profit. It has no retail price of
+// its own; one is stored because two places read it:
+//   * Warranty invoices print retail × 0.85 as the rate (client
+//     utils/invoiceCalculations.js), so retail = rate ÷ 0.85 prints the rate;
+//   * Inventory → Edit requires sale rate ≤ retail price.
+const WARRANTY_RATE_FACTOR = 0.85;
+const byProductRetail = (rate) => Math.min(round2(rate / WARRANTY_RATE_FACTOR), MAX_MONEY);
 // The products list also says how far each pack size's formula is set up:
 // the group's raw materials and this pack size's own packaging.
 const FORMULA_STATE_COLUMNS = `,
@@ -384,14 +394,18 @@ async function validateProduct(conn, body, kind, excludeId) {
     if (!uom) throw fail(400, 'Choose the unit.', { field: 'uom_id' });
     Object.assign(values, { pack_size: uom.symbol, pack_type: null, pack_type_id: null, volume: 1, volume_uom_id: uom.id });
     values.category_id = null;
-    values.purchase_rate = moneyField(body, 'purchase_rate', { label: 'a purchase rate', allowZero: true });
   }
   if (body.company_id === undefined || body.company_id === null || body.company_id === '') {
     throw fail(400, 'Choose the company.', { field: 'company_id' });
   }
   values.company_id = await optionalRef(conn, 'companies', body.company_id, 'company_id', 'Choose a company from the list.');
-  values.sale_rate = moneyField(body, 'sale_rate', { label: 'a sale rate' });
-  values.retail_price = moneyField(body, 'retail_price', { label: 'a retail price' });
+  if (kind === 'product') {
+    values.sale_rate = moneyField(body, 'sale_rate', { label: 'a sale rate' });
+    values.retail_price = moneyField(body, 'retail_price', { label: 'a retail price' });
+  } else {
+    const rate = moneyField(body, 'rate', { label: 'a rate' });
+    Object.assign(values, { purchase_rate: rate, sale_rate: rate, retail_price: byProductRetail(rate) });
+  }
   Object.assign(values, taxFields(body));
 
   if (kind === 'product') {
@@ -485,7 +499,7 @@ function productRoutes(path, kind) {
       const params = [v.name, v.pack_size, v.pack_type, v.pack_type_id, v.volume, v.volume_uom_id, v.sale_rate, v.retail_price,
         v.company_id, v.category_id, v.tax_applicable, v.sale_tax_pct];
       // A manufactured product's purchase rate is its latest batch cost, set when a
-      // batch is sent to inventory; a by-product's is entered here.
+      // batch is sent to inventory; a by-product's is its rate, entered here.
       if (kind === 'by_product') { fields.push('purchase_rate=?'); params.push(v.purchase_rate); }
       await conn.query(`UPDATE products SET ${fields.join(', ')} WHERE id=?`, [...params, current.id]);
       if (kind === 'product') await followGroupFormula(conn, current, v);
@@ -992,16 +1006,15 @@ async function planBatch(conn, body, { lock }) {
     if (isDate(batchDate) && b.exp_date <= batchDate) {
       throw stepError('byproducts', 'exp_date', `The expiry date of ${prod.name} must be after the batch date.`, i);
     }
-    // Purchase rate (its value inside the batch, deducted from the packs' cost)
-    // and sale rate (what inventory sells it at) are set per batch. Left blank,
-    // each falls back to the by-product's own rate.
-    const rate = blankValue(b.purchase_rate) ? (parseFloat(prod.purchase_rate) || 0) : num(b.purchase_rate);
-    if (!Number.isFinite(rate) || rate < 0) throw stepError('byproducts', 'purchase_rate', `Enter a purchase rate of 0 or more for ${prod.name}.`, i);
-    if (rate > MAX_MONEY || !decimalsOk(rate, 4)) throw stepError('byproducts', 'purchase_rate', `Enter the purchase rate of ${prod.name} with at most 4 decimals.`, i);
-    const saleRate = blankValue(b.sale_rate) ? (parseFloat(prod.sale_rate) || 0) : num(b.sale_rate);
-    if (!Number.isFinite(saleRate) || saleRate <= 0) throw stepError('byproducts', 'sale_rate', `Enter a sale rate greater than 0 for ${prod.name}.`, i);
-    if (saleRate > MAX_MONEY || !decimalsOk(saleRate, 2)) throw stepError('byproducts', 'sale_rate', `Enter the sale rate of ${prod.name} with at most 2 decimals.`, i);
-    return { prod, qty, rate, saleRate: round2(saleRate), batchNo, expDate: b.exp_date };
+    // One rate per batch (byProductRetail): its value inside the batch,
+    // deducted from the packs' cost, and the rate inventory sells it at. Left
+    // blank, it is the by-product's own rate. A client from before the single
+    // rate sends purchase_rate.
+    const given = blankValue(b.rate) ? b.purchase_rate : b.rate;
+    const rate = blankValue(given) ? (parseFloat(prod.sale_rate) || 0) : num(given);
+    if (!Number.isFinite(rate) || rate <= 0) throw stepError('byproducts', 'rate', `Enter a rate greater than 0 for ${prod.name}.`, i);
+    if (rate > MAX_MONEY || !decimalsOk(rate, 2)) throw stepError('byproducts', 'rate', `Enter the rate of ${prod.name} with at most 2 decimals.`, i);
+    return { prod, qty, rate: round2(rate), saleRate: round2(rate), batchNo, expDate: b.exp_date };
   });
 
   // ── Step 5: misc expense ──
@@ -1028,7 +1041,7 @@ async function planBatch(conn, body, { lock }) {
   });
   if (costing.sharedCost < 0) {
     throw stepError('byproducts', 'qty',
-      `The by-products are valued at ${fmtPKR(costing.byProductValue)}, more than the raw materials and expense of ${fmtPKR(costing.rawCost + costing.miscExpense)}. Lower a quantity or the by-product's purchase rate.`);
+      `The by-products are valued at ${fmtPKR(costing.byProductValue)}, more than the raw materials and expense of ${fmtPKR(costing.rawCost + costing.miscExpense)}. Lower a quantity or the by-product's rate.`);
   }
   if (costing.totalCost > MAX_MONEY) throw stepError('materials', 'qty', 'The batch cost is too large to record.');
 
@@ -1519,6 +1532,11 @@ router.post('/batches/:id/send-to-inventory', auth, canSendToInventory, async (r
 
     for (const line of lines) {
       const [[prod]] = await conn.query('SELECT sale_rate, retail_price FROM products WHERE id = ?', [line.productId]);
+      // Packs sell at the product's rates. A by-product sells at the rate set on
+      // its batch, with the retail price that goes with it (byProductRetail).
+      const byLine = line.kind === 'byproduct';
+      const saleRate = byLine && line.saleRate > 0 ? line.saleRate : parseFloat(prod?.sale_rate || 0);
+      const retailPrice = byLine ? byProductRetail(saleRate) : parseFloat(prod?.retail_price || 0);
       // mfg_yield_items is what the Sale & Stock report counts as manufactured stock in.
       if (line.kind === 'pack') {
         const p = line.pack;
@@ -1550,9 +1568,7 @@ router.post('/batches/:id/send-to-inventory', auth, canSendToInventory, async (r
       await conn.query(
         `INSERT INTO inventory (product_id, batch_no, qty, purchase_rate, sale_rate, retail_price, exp_date)
          VALUES (?,?,?,?,?,?,?)`,
-        // A by-product sells at the rate set on its batch; packs at the product's.
-        [line.productId, line.batchNo, line.qty, round4(line.rate),
-         line.saleRate > 0 ? line.saleRate : parseFloat(prod?.sale_rate || 0), parseFloat(prod?.retail_price || 0), line.expDate]
+        [line.productId, line.batchNo, line.qty, round4(line.rate), saleRate, retailPrice, line.expDate]
       );
       await recordInventoryMovement(conn, {
         productId: line.productId, batchNo: line.batchNo, date: today, refType: 'manufacturing',
