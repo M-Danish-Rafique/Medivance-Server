@@ -8,18 +8,25 @@ const { todayPKT } = require('../utils/dateUtils');
 const { num, cleanText, normKey, normSql, isDate, fmtPKR, plural, fail, sendError } = require('../utils/manufacturing');
 
 // ─── Assets register ───────────────────────────────────────────────────────
-// What the organization owns, who owns each item (a partner, a director, the
-// company itself) and what it cost. Two managed lists (types, owners) and the
-// assets themselves. Nothing here posts to Finance or any ledger: many assets
-// are historical or were paid for by a partner.
+// What the organization has today, who owns each item and what it is worth
+// now (its current value, not what was paid for it). Three managed lists
+// (types, owners, reasons) and the assets themselves. Nothing here posts to
+// Finance or any ledger: many assets are historical or were paid for by a
+// partner.
 //   code         AST-0001, from asset_code_counter (locked) inside the insert
 //                transaction; never reused after a delete, never changed
-//   total_price  what was paid (authoritative); unit_price is a display value
-//                that must agree with it: |qty × unit − total| ≤ 0.005 × qty
-//   lifecycle    in_use -> disposed (date + optional note) -> back to in_use.
-//                Disposing part of the quantity splits the row: the disposed
+//   total_value  the current value of the whole entry (authoritative);
+//                unit_value is a display value that must agree with it:
+//                |qty × unit − total| ≤ 0.005 × qty
+//   value_as_of  the date that value applies to: today on add and on an edit
+//                that changes the value; the chosen date on POST /:id/value.
+//                Every change is kept in asset_value_log (the detail view's
+//                value history)
+//   lifecycle    active -> retired (a reason such as Sold, Scrapped or Lost,
+//                a retirement date and an optional note) -> reinstated to
+//                active. Retiring part of the quantity splits the row: that
 //                part becomes a new row (new code, split_from_id = original,
-//                same unit price); the original keeps the rest and the
+//                same unit value); the original keeps the rest and the
 //                difference of the totals, so the sum is preserved exactly
 //   edits        PUT carries expected_updated_at; a save against an older
 //                version is refused with 409 ASSET_CHANGED
@@ -27,10 +34,10 @@ const { num, cleanText, normKey, normSql, isDate, fmtPKR, plural, fail, sendErro
 // logs out on any 403). Mirrored for the UX in client/src/pages/assets/Assets.jsx.
 router.use(auth, requirePermission('perm_assets', 'Assets'));
 
-const MAX_PRICE = 999999999.99;
+const MAX_VALUE = 999999999.99;
 const MAX_QTY = 99999;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-/** '2026-10-18' -> '18 Oct 2026' (audit descriptions). */
+/** '2026-10-18' -> '18 Oct 2026' (audit descriptions and messages). */
 const fmtDay = (iso) => {
   const [y, m, d] = String(iso || '').split('-').map(Number);
   return y && m && d ? `${d} ${MONTHS[m - 1]} ${y}` : '';
@@ -39,11 +46,15 @@ const label = (a) => `"${a.code} ${a.name}"`;
 const stampSql = (column) => `DATE_FORMAT(${column}, '%Y-%m-%d %H:%i:%s.%f')`;
 /** Money -> whole paisa, so totals compare and split without float noise. */
 const paisa = (value) => Math.round(Number(value) * 100);
+/** The later of two 'YYYY-MM-DD' dates (either may be null). */
+const laterDate = (a, b) => (!a ? b : !b ? a : a > b ? a : b);
 
-// ── Managed lists: asset types and owners ──────────────────────────────────
-// Same rules for both: a name is required, cleaned, unique case-insensitively
-// (normKey). Renaming is allowed while in use (assets refer to the id, so
-// every row shows the new name); deleting one in use is refused.
+// ── Managed lists: asset types, owners and reasons ─────────────────────────
+// Same rules for all three: a name is required, cleaned, unique
+// case-insensitively (normKey). Renaming is allowed while in use (assets refer
+// to the id, so every row shows the new name); deleting one in use is refused.
+// Reasons say why an asset was retired (Sold, Scrapped, Lost …); the users
+// keep that list themselves.
 const onThose = (n) => (Number(n) === 1 ? 'on that asset' : 'on those assets');
 const LISTS = {
   types: {
@@ -55,6 +66,11 @@ const LISTS = {
     table: 'asset_owners', column: 'owner_id', max: 60, module: 'assets/owners',
     noun: 'asset owner', aNoun: 'an owner', what: 'owner',
     inUse: (r) => `${r.name} is the owner of ${plural(r.asset_count, 'asset', 'assets')}. Choose another owner ${onThose(r.asset_count)} first.`,
+  },
+  reasons: {
+    table: 'asset_reasons', column: 'reason_id', max: 40, module: 'assets/reasons',
+    noun: 'reason', aNoun: 'a reason', what: 'reason',
+    inUse: (r) => `${r.name} is the reason on ${plural(r.asset_count, 'asset', 'assets')}. Choose another reason ${onThose(r.asset_count)} first.`,
   },
 };
 const listSelect = (list) => `
@@ -137,14 +153,19 @@ Object.entries(LISTS).forEach(([path, list]) => {
 // ── Assets ─────────────────────────────────────────────────────────────────
 const ASSET_SELECT = `
   SELECT a.id, a.code, a.name, a.serial_no, a.asset_type_id, t.name AS type_name, a.owner_id, o.name AS owner_name,
-         a.qty, a.unit_price, a.total_price, DATE_FORMAT(a.purchase_date, '%Y-%m-%d') AS purchase_date,
-         a.description, a.status, DATE_FORMAT(a.disposed_on, '%Y-%m-%d') AS disposed_on, a.disposal_note,
-         a.split_from_id, a.created_by, COALESCE(cu.full_name, cu.username) AS created_by_name,
+         a.qty, a.unit_value, a.total_value, DATE_FORMAT(a.value_as_of, '%Y-%m-%d') AS value_as_of,
+         DATE_FORMAT(a.purchase_date, '%Y-%m-%d') AS purchase_date, a.description,
+         a.status, a.reason_id, r.name AS reason_name,
+         DATE_FORMAT(a.retired_on, '%Y-%m-%d') AS retired_on, a.retirement_note,
+         a.split_from_id, sf.code AS split_from_code,
+         a.created_by, COALESCE(cu.full_name, cu.username) AS created_by_name,
          DATE_FORMAT(a.created_at, '%Y-%m-%d %H:%i:%s') AS created_at,
          a.updated_by, COALESCE(uu.full_name, uu.username) AS updated_by_name, ${stampSql('a.updated_at')} AS updated_at
     FROM assets a
     JOIN asset_types t ON t.id = a.asset_type_id
     JOIN asset_owners o ON o.id = a.owner_id
+    LEFT JOIN asset_reasons r ON r.id = a.reason_id
+    LEFT JOIN assets sf ON sf.id = a.split_from_id
     LEFT JOIN users cu ON cu.id = a.created_by
     LEFT JOIN users uu ON uu.id = a.updated_by`;
 
@@ -156,9 +177,10 @@ async function loadAsset(conn, id) {
 /** Locks the row for the rest of the transaction. */
 async function lockAsset(conn, id) {
   const [[row]] = await conn.query(
-    `SELECT id, code, name, serial_no, asset_type_id, owner_id, qty, unit_price, total_price,
-            DATE_FORMAT(purchase_date, '%Y-%m-%d') AS purchase_date, description, status,
-            DATE_FORMAT(disposed_on, '%Y-%m-%d') AS disposed_on, ${stampSql('updated_at')} AS updated_at
+    `SELECT id, code, name, serial_no, asset_type_id, owner_id, qty, unit_value, total_value,
+            DATE_FORMAT(value_as_of, '%Y-%m-%d') AS value_as_of,
+            DATE_FORMAT(purchase_date, '%Y-%m-%d') AS purchase_date, description, status, reason_id,
+            DATE_FORMAT(retired_on, '%Y-%m-%d') AS retired_on, ${stampSql('updated_at')} AS updated_at
        FROM assets WHERE id = ? FOR UPDATE`, [id]
   );
   if (!row) throw fail(404, 'This asset no longer exists.');
@@ -174,15 +196,25 @@ async function nextCode(conn) {
   return `AST-${String(next).padStart(4, '0')}`;
 }
 
+/** One line of the value history (asset_value_log). `kind`: added | edited
+ *  | revalued | split. `previous` is the total before the change (null on add). */
+async function logValue(conn, { assetId, kind, valuedOn, qty, total, previous = null, note = null, userId }) {
+  await conn.query(
+    `INSERT INTO asset_value_log (asset_id, kind, valued_on, qty, total_value, previous_total, note, created_by, created_at)
+     VALUES (?,?,?,?,?,?,?,?,NOW(3))`,
+    [assetId, kind, valuedOn, qty, total, previous, note, userId]
+  );
+}
+
 const fieldError = (field, message, status = 400) => fail(status, message, { field });
 
-/** A money figure: 0 to MAX_PRICE, at most 2 decimals. */
-function parsePrice(value, field) {
-  if (value === null || value === undefined || String(value).trim() === '') throw fieldError(field, 'Enter the price.');
+/** A money figure: 0 to MAX_VALUE, at most 2 decimals. */
+function parseValue(value, field) {
+  if (value === null || value === undefined || String(value).trim() === '') throw fieldError(field, 'Enter the value.');
   const n = num(value);
-  if (!Number.isFinite(n) || n < 0) throw fieldError(field, 'Enter a price of 0 or more.');
-  if (n > MAX_PRICE) throw fieldError(field, `Enter a price of ${fmtPKR(MAX_PRICE)} or less.`);
-  if (Math.abs(n * 100 - Math.round(n * 100)) > 1e-6) throw fieldError(field, 'Enter the price with no more than 2 decimals.');
+  if (!Number.isFinite(n) || n < 0) throw fieldError(field, 'Enter a value of 0 or more.');
+  if (n > MAX_VALUE) throw fieldError(field, `Enter a value of ${fmtPKR(MAX_VALUE)} or less.`);
+  if (Math.abs(n * 100 - Math.round(n * 100)) > 1e-6) throw fieldError(field, 'Enter the value with no more than 2 decimals.');
   return Math.round(n * 100) / 100;
 }
 
@@ -212,6 +244,22 @@ async function requireListItem(conn, list, id, missing) {
   return row.id;
 }
 
+/** Reason, date and note of a retirement (the edit form of a retired asset
+ *  and POST /:id/retire share these rules). */
+async function validateRetirement(conn, { reasonId, date, note, noteField }, purchaseDate) {
+  const out = {};
+  out.reasonId = await requireListItem(conn, LISTS.reasons, reasonId, 'Choose why it is being retired.');
+  out.date = parseDate(date, 'retired_on', {
+    required: true, missing: 'Enter the retirement date.', future: "The retirement date can't be in the future.",
+  });
+  if (purchaseDate && out.date < purchaseDate) {
+    throw fieldError('retired_on', "The retirement date can't be before the purchase date.");
+  }
+  out.note = cleanText(note) || null;
+  if (out.note && out.note.length > 200) throw fieldError(noteField, 'The note must have 200 characters or fewer.');
+  return out;
+}
+
 /** Validates an add or edit; the first problem is returned as { field, message }. */
 async function validateAsset(conn, body, current) {
   const name = cleanText(body.name);
@@ -222,27 +270,22 @@ async function validateAsset(conn, body, current) {
   const typeId = await requireListItem(conn, LISTS.types, body.asset_type_id, 'Choose a type.');
   const ownerId = await requireListItem(conn, LISTS.owners, body.owner_id, 'Choose who owns it.');
   const qty = parseQty(body.qty, MAX_QTY, `Enter a quantity of ${MAX_QTY.toLocaleString('en-US')} or less.`);
-  const unit = parsePrice(body.unit_price, 'unit_price');
-  const total = parsePrice(body.total_price, 'total_price');
-  // The total is what was paid; the unit price must agree with it to within
-  // half a paisa per item (the rounding of total ÷ qty).
+  const unit = parseValue(body.unit_value, 'unit_value');
+  const total = parseValue(body.total_value, 'total_value');
+  // The total is the current value; the unit value must agree with it to
+  // within half a paisa per item (the rounding of total ÷ qty).
   if (Math.abs(qty * paisa(unit) - paisa(total)) > 0.5 * qty + 1e-9) {
-    throw fieldError('unit_price', 'The unit price does not match the total for this quantity. Check the figures.');
+    throw fieldError('unit_value', 'The unit value does not match the total for this quantity. Check the figures.');
   }
   const purchaseDate = parseDate(body.purchase_date, 'purchase_date', { future: "The purchase date can't be in the future." });
   const description = cleanText(body.description) || null;
   if (description && description.length > 500) throw fieldError('description', 'The description must have 500 characters or fewer.');
 
   const out = { name, serial, typeId, ownerId, qty, unit, total, purchaseDate, description };
-  if (current?.status === 'disposed') {
-    out.disposedOn = parseDate(body.disposed_on, 'disposed_on', {
-      required: true, missing: 'Enter the disposal date.', future: "The disposal date can't be in the future.",
-    });
-    if (purchaseDate && out.disposedOn < purchaseDate) {
-      throw fieldError('disposed_on', "The disposal date can't be before the purchase date.");
-    }
-    out.note = cleanText(body.disposal_note) || null;
-    if (out.note && out.note.length > 200) throw fieldError('disposal_note', 'The note must have 200 characters or fewer.');
+  if (current?.status === 'retired') {
+    out.retirement = await validateRetirement(conn, {
+      reasonId: body.reason_id, date: body.retired_on, note: body.retirement_note, noteField: 'retirement_note',
+    }, purchaseDate);
   }
   return out;
 }
@@ -254,6 +297,30 @@ router.get('/', async (req, res) => {
   } catch (err) { sendError(res, err, 'The assets could not be loaded.'); }
 });
 
+// One asset with its value history (newest first) and the entries split off
+// it. Registered after the list routes, so /types, /owners and /reasons never
+// reach it.
+router.get('/:id', async (req, res) => {
+  try {
+    const asset = await loadAsset(db, req.params.id);
+    if (!asset) throw fail(404, 'This asset no longer exists.');
+    const [history] = await db.query(
+      `SELECT h.id, h.kind, DATE_FORMAT(h.valued_on, '%Y-%m-%d') AS valued_on, h.qty, h.total_value, h.previous_total,
+              h.note, COALESCE(u.full_name, u.username) AS by_name, DATE_FORMAT(h.created_at, '%Y-%m-%d %H:%i:%s') AS created_at
+         FROM asset_value_log h
+         LEFT JOIN users u ON u.id = h.created_by
+        WHERE h.asset_id = ?
+        ORDER BY h.valued_on DESC, h.id DESC`, [asset.id]
+    );
+    const [parts] = await db.query(
+      `SELECT a.id, a.code, a.qty, a.status, r.name AS reason_name
+         FROM assets a LEFT JOIN asset_reasons r ON r.id = a.reason_id
+        WHERE a.split_from_id = ? ORDER BY a.id`, [asset.id]
+    );
+    res.json({ ...asset, history, parts });
+  } catch (err) { sendError(res, err, 'The asset could not be loaded.'); }
+});
+
 router.post('/', async (req, res) => {
   const conn = await db.getConnection();
   let created;
@@ -262,12 +329,14 @@ router.post('/', async (req, res) => {
     const v = await validateAsset(conn, req.body || {});
     const code = await nextCode(conn);
     const userId = req.user?.id || null;
+    const today = todayPKT();
     const [result] = await conn.query(
-      `INSERT INTO assets (code, name, serial_no, asset_type_id, owner_id, qty, unit_price, total_price, purchase_date,
-                           description, status, created_by, created_at, updated_by, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,'in_use',?,NOW(3),?,NOW(3))`,
-      [code, v.name, v.serial, v.typeId, v.ownerId, v.qty, v.unit, v.total, v.purchaseDate, v.description, userId, userId]
+      `INSERT INTO assets (code, name, serial_no, asset_type_id, owner_id, qty, unit_value, total_value, value_as_of,
+                           purchase_date, description, status, created_by, created_at, updated_by, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,'active',?,NOW(3),?,NOW(3))`,
+      [code, v.name, v.serial, v.typeId, v.ownerId, v.qty, v.unit, v.total, today, v.purchaseDate, v.description, userId, userId]
     );
+    await logValue(conn, { assetId: result.insertId, kind: 'added', valuedOn: today, qty: v.qty, total: v.total, userId });
     await conn.commit();
     created = { id: result.insertId, code, ...v };
   } catch (err) {
@@ -276,8 +345,8 @@ router.post('/', async (req, res) => {
     return sendError(res, err, 'The asset could not be added. Try again.');
   }
   conn.release();
-  const price = created.qty > 1 ? `${created.qty} × ${fmtPKR(created.unit)}` : fmtPKR(created.total);
-  await logAudit(req, 'CREATE', 'assets', created.id, `Added asset ${label(created)} (${price})`);
+  const value = created.qty > 1 ? `${created.qty} × ${fmtPKR(created.unit)}` : fmtPKR(created.total);
+  await logAudit(req, 'CREATE', 'assets', created.id, `Added asset ${label(created)} (${value})`);
   res.status(201).json(await loadAsset(db, created.id));
 });
 
@@ -285,6 +354,7 @@ router.put('/:id', async (req, res) => {
   const conn = await db.getConnection();
   let current;
   let v;
+  let valueChanged = false;
   let stale = false;
   try {
     await conn.beginTransaction();
@@ -294,14 +364,27 @@ router.put('/:id', async (req, res) => {
       await conn.rollback();
     } else {
       v = await validateAsset(conn, req.body || {}, current);
+      const userId = req.user?.id || null;
+      const today = todayPKT();
+      // A new figure (or quantity) is the value as of today; otherwise the
+      // date stays, moved up to the purchase date if that is now later.
+      valueChanged = paisa(v.total) !== paisa(current.total_value) || v.qty !== Number(current.qty);
+      const valueAsOf = valueChanged ? today : laterDate(current.value_as_of, v.purchaseDate);
+      const out = v.retirement || { reasonId: null, date: null, note: null };
       await conn.query(
-        `UPDATE assets SET name=?, serial_no=?, asset_type_id=?, owner_id=?, qty=?, unit_price=?, total_price=?, purchase_date=?,
-                           description=?, disposed_on=?, disposal_note=?, updated_by=?, updated_at=NOW(3)
+        `UPDATE assets SET name=?, serial_no=?, asset_type_id=?, owner_id=?, qty=?, unit_value=?, total_value=?, value_as_of=?,
+                           purchase_date=?, description=?, reason_id=?, retired_on=?, retirement_note=?,
+                           updated_by=?, updated_at=NOW(3)
           WHERE id=?`,
-        [v.name, v.serial, v.typeId, v.ownerId, v.qty, v.unit, v.total, v.purchaseDate, v.description,
-          current.status === 'disposed' ? v.disposedOn : null, current.status === 'disposed' ? v.note : null,
-          req.user?.id || null, current.id]
+        [v.name, v.serial, v.typeId, v.ownerId, v.qty, v.unit, v.total, valueAsOf, v.purchaseDate, v.description,
+          out.reasonId, out.date, out.note, userId, current.id]
       );
+      if (valueChanged) {
+        await logValue(conn, {
+          assetId: current.id, kind: 'edited', valuedOn: today, qty: v.qty, total: v.total,
+          previous: current.total_value, userId,
+        });
+      }
       await conn.commit();
     }
   } catch (err) {
@@ -312,8 +395,8 @@ router.put('/:id', async (req, res) => {
   conn.release();
   try {
     if (stale) {
-      // Saved (edited, disposed or restored) by someone else since this
-      // version was loaded: nothing is written.
+      // Saved (edited, revalued, retired or reinstated) by someone
+      // else since this version was loaded: nothing is written.
       const latest = await loadAsset(db, current.id);
       return res.status(409).json({
         code: 'ASSET_CHANGED',
@@ -323,7 +406,8 @@ router.put('/:id', async (req, res) => {
         updated_at: latest?.updated_at ?? null,
       });
     }
-    await logAudit(req, 'UPDATE', 'assets', current.id, `Updated asset ${label({ code: current.code, name: v.name })}`);
+    const valueText = valueChanged ? ` (value ${fmtPKR(current.total_value)} -> ${fmtPKR(v.total)})` : '';
+    await logAudit(req, 'UPDATE', 'assets', current.id, `Updated asset ${label({ code: current.code, name: v.name })}${valueText}`);
     res.json(await loadAsset(db, current.id));
   } catch (err) { sendError(res, err, 'The asset could not be loaded. Refresh the page.'); }
 });
@@ -332,110 +416,173 @@ router.delete('/:id', async (req, res) => {
   try {
     const existing = await loadAsset(db, req.params.id);
     if (!existing) throw fail(404, 'This asset no longer exists.');
-    // A part split off this entry keeps its own record (split_from_id SET NULL).
+    // A part split off this entry keeps its own record (split_from_id SET
+    // NULL); the value history goes with the entry (ON DELETE CASCADE).
     await db.query('DELETE FROM assets WHERE id = ?', [existing.id]);
     await logAudit(req, 'DELETE', 'assets', existing.id, `Deleted asset ${label(existing)}`);
     res.json({ message: `${existing.code} deleted.` });
   } catch (err) { sendError(res, err, 'The asset could not be deleted. Try again.'); }
 });
 
-// Body { qty, disposed_on, note }. The whole quantity: the row moves to
-// disposed. Part of it: split (see the header). Returns { asset, disposed }:
-// the original row as it now stands, and the disposed row (the same row when
-// the whole quantity was disposed).
-router.post('/:id/dispose', async (req, res) => {
+// Body { total_value, valued_on, note }: what the whole entry is worth on
+// that date. The unit value is derived (total ÷ qty, to the paisa). The date
+// can't be in the future, before the purchase date, or before the date the
+// current value already applies to. The same figure on a later date is
+// allowed: it records that the value was checked and still holds.
+router.post('/:id/value', async (req, res) => {
+  const conn = await db.getConnection();
+  let a;
+  let total;
+  let valuedOn;
+  try {
+    await conn.beginTransaction();
+    a = await lockAsset(conn, req.params.id);
+    if (a.status !== 'active') throw fail(409, `${a.code} is retired. Reinstate it to update its value.`);
+    const body = req.body || {};
+    total = parseValue(body.total_value, 'total_value');
+    valuedOn = parseDate(body.valued_on, 'valued_on', {
+      required: true, missing: 'Enter the date of this value.', future: "The date can't be in the future.",
+    });
+    if (a.purchase_date && valuedOn < a.purchase_date) {
+      throw fieldError('valued_on', "The date can't be before the purchase date.");
+    }
+    if (a.value_as_of && valuedOn < a.value_as_of) {
+      throw fieldError('valued_on', `The value is already recorded as of ${fmtDay(a.value_as_of)}. Choose that date or later.`);
+    }
+    if (paisa(total) === paisa(a.total_value) && valuedOn === a.value_as_of) {
+      throw fieldError('total_value', 'This is already the value on that date. Enter a new value or a later date.');
+    }
+    const note = cleanText(body.note) || null;
+    if (note && note.length > 200) throw fieldError('note', 'The note must have 200 characters or fewer.');
+    const unit = Math.round(paisa(total) / Number(a.qty)) / 100;
+    const userId = req.user?.id || null;
+    await conn.query(
+      'UPDATE assets SET unit_value=?, total_value=?, value_as_of=?, updated_by=?, updated_at=NOW(3) WHERE id=?',
+      [unit, total, valuedOn, userId, a.id]
+    );
+    await logValue(conn, {
+      assetId: a.id, kind: 'revalued', valuedOn, qty: a.qty, total, previous: a.total_value, note, userId,
+    });
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback().catch(() => {});
+    conn.release();
+    return sendError(res, err, 'The value could not be updated. Try again.');
+  }
+  conn.release();
+  await logAudit(req, 'UPDATE', 'assets', a.id,
+    `Updated the value of ${label(a)} from ${fmtPKR(a.total_value)} to ${fmtPKR(total)} as of ${fmtDay(valuedOn)}`);
+  res.json(await loadAsset(db, a.id));
+});
+
+// Body { qty, reason_id, retired_on, note }. The whole quantity: the row is
+// retired. Part of it: split (see the header). Returns { asset, retired }:
+// the original row as it now stands, and the retired row (the same row when
+// the whole quantity was retired).
+router.post('/:id/retire', async (req, res) => {
   const conn = await db.getConnection();
   let a;
   let n;
-  let disposedOn;
+  let out;
+  let reasonName = null;
   let splitId = null;
   let splitCode = null;
   try {
     await conn.beginTransaction();
     a = await lockAsset(conn, req.params.id);
-    if (a.status !== 'in_use') throw fail(409, `${a.code} is already disposed.`);
+    if (a.status !== 'active') throw fail(409, `${a.code} is already retired.`);
     const body = req.body || {};
     n = body.qty === undefined || body.qty === null || body.qty === ''
       ? a.qty
       : parseQty(body.qty, a.qty, `Enter a quantity of ${a.qty.toLocaleString('en-US')} or less.`);
-    disposedOn = parseDate(body.disposed_on, 'disposed_on', {
-      required: true, missing: 'Enter the disposal date.', future: "The disposal date can't be in the future.",
-    });
-    if (a.purchase_date && disposedOn < a.purchase_date) {
-      throw fieldError('disposed_on', "The disposal date can't be before the purchase date.");
-    }
-    const note = cleanText(body.note) || null;
-    if (note && note.length > 200) throw fieldError('note', 'The note must have 200 characters or fewer.');
+    out = await validateRetirement(conn, {
+      reasonId: body.reason_id, date: body.retired_on, note: body.note, noteField: 'note',
+    }, a.purchase_date);
+    const [[reason]] = await conn.query('SELECT name FROM asset_reasons WHERE id = ?', [out.reasonId]);
+    reasonName = reason?.name || null;
     const userId = req.user?.id || null;
 
     if (n === a.qty) {
       await conn.query(
-        `UPDATE assets SET status='disposed', disposed_on=?, disposal_note=?, updated_by=?, updated_at=NOW(3) WHERE id=?`,
-        [disposedOn, note, userId, a.id]
+        `UPDATE assets SET status='retired', reason_id=?, retired_on=?, retirement_note=?, updated_by=?, updated_at=NOW(3)
+          WHERE id=?`,
+        [out.reasonId, out.date, out.note, userId, a.id]
       );
     } else {
-      // Same unit price on both parts. The disposed part is unit × n; the
+      // Same unit value on both parts. The retired part is unit × n; the
       // original keeps the rest of the total, so the two always add up to
-      // what was paid (never below zero for an unusually rounded unit price).
-      // When the unit price was itself rounded (1,000.00 ÷ 3 = 333.33), the
-      // part left over can differ from unit × qty by more than half a paisa
-      // per item (333.34 for 1); its unit price is then re-derived from its
-      // total, so every row keeps |qty × unit − total| ≤ 0.005 × qty.
-      const unitP = paisa(a.unit_price);
-      const totalP = paisa(a.total_price);
-      const disposedP = Math.min(unitP * n, totalP);
-      const keptP = totalP - disposedP;
+      // the value before the split (never below zero for an unusually
+      // rounded unit value). When the unit value was itself rounded
+      // (1,000.00 ÷ 3 = 333.33), the part left over can differ from
+      // unit × qty by more than half a paisa per item (333.34 for 1); its
+      // unit value is then re-derived from its total, so every row keeps
+      // |qty × unit − total| ≤ 0.005 × qty. Both parts keep value_as_of.
+      const unitP = paisa(a.unit_value);
+      const totalP = paisa(a.total_value);
+      const movedP = Math.min(unitP * n, totalP);
+      const keptP = totalP - movedP;
       const unitFor = (qty, partP) => (Math.abs(qty * unitP - partP) > 0.5 * qty ? Math.round(partP / qty) : unitP) / 100;
       splitCode = await nextCode(conn);
       const [result] = await conn.query(
-        `INSERT INTO assets (code, name, serial_no, asset_type_id, owner_id, qty, unit_price, total_price, purchase_date,
-                             description, status, disposed_on, disposal_note, split_from_id,
+        `INSERT INTO assets (code, name, serial_no, asset_type_id, owner_id, qty, unit_value, total_value, value_as_of,
+                             purchase_date, description, status, reason_id, retired_on, retirement_note, split_from_id,
                              created_by, created_at, updated_by, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,'disposed',?,?,?,?,NOW(3),?,NOW(3))`,
-        [splitCode, a.name, a.serial_no, a.asset_type_id, a.owner_id, n, unitFor(n, disposedP), disposedP / 100, a.purchase_date,
-          a.description, disposedOn, note, a.id, userId, userId]
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,'retired',?,?,?,?,?,NOW(3),?,NOW(3))`,
+        [splitCode, a.name, a.serial_no, a.asset_type_id, a.owner_id, n, unitFor(n, movedP), movedP / 100, a.value_as_of,
+          a.purchase_date, a.description, out.reasonId, out.date, out.note, a.id, userId, userId]
       );
       splitId = result.insertId;
       await conn.query(
-        'UPDATE assets SET qty=?, unit_price=?, total_price=?, updated_by=?, updated_at=NOW(3) WHERE id=?',
+        'UPDATE assets SET qty=?, unit_value=?, total_value=?, updated_by=?, updated_at=NOW(3) WHERE id=?',
         [a.qty - n, unitFor(a.qty - n, keptP), keptP / 100, userId, a.id]
       );
+      await logValue(conn, {
+        assetId: a.id, kind: 'split', valuedOn: out.date, qty: a.qty - n, total: keptP / 100,
+        previous: a.total_value, note: `${n} retired as ${splitCode}`, userId,
+      });
+      await logValue(conn, {
+        assetId: splitId, kind: 'split', valuedOn: out.date, qty: n, total: movedP / 100,
+        note: `Split from ${a.code}`, userId,
+      });
     }
     await conn.commit();
   } catch (err) {
     await conn.rollback().catch(() => {});
     conn.release();
-    return sendError(res, err, 'The asset could not be marked as disposed. Try again.');
+    return sendError(res, err, 'The asset could not be retired. Try again.');
   }
   conn.release();
+  const why = reasonName ? ` (${reasonName})` : '';
   await logAudit(req, 'UPDATE', 'assets', a.id, splitId
-    ? `Disposed ${n} of ${a.qty} ${label(a)} on ${fmtDay(disposedOn)} (split to ${splitCode})`
-    : `Disposed ${a.qty > 1 ? `${n} of ${a.qty} ` : ''}${label(a)} on ${fmtDay(disposedOn)}`);
+    ? `Retired ${n} of ${a.qty} ${label(a)} on ${fmtDay(out.date)}${why} (split to ${splitCode})`
+    : `Retired ${a.qty > 1 ? `${n} of ${a.qty} ` : ''}${label(a)} on ${fmtDay(out.date)}${why}`);
   const asset = await loadAsset(db, a.id);
-  res.json({ asset, disposed: splitId ? await loadAsset(db, splitId) : asset });
+  res.json({ asset, retired: splitId ? await loadAsset(db, splitId) : asset });
 });
 
-// Back to in use: the disposal date and note are cleared. A split part stays
-// its own entry (it is not merged back into the row it came from).
-router.post('/:id/restore', async (req, res) => {
+// Reinstate: back to active; the reason, retirement date and note are
+// cleared. A split part stays its own entry (it is not merged back into the
+// row it came from).
+router.post('/:id/reinstate', async (req, res) => {
   const conn = await db.getConnection();
   let a;
   try {
     await conn.beginTransaction();
     a = await lockAsset(conn, req.params.id);
-    if (a.status !== 'disposed') throw fail(409, `${a.code} is already in use.`);
+    if (a.status !== 'retired') throw fail(409, `${a.code} is already active.`);
     await conn.query(
-      `UPDATE assets SET status='in_use', disposed_on=NULL, disposal_note=NULL, updated_by=?, updated_at=NOW(3) WHERE id=?`,
+      `UPDATE assets SET status='active', reason_id=NULL, retired_on=NULL, retirement_note=NULL, updated_by=?, updated_at=NOW(3)
+        WHERE id=?`,
       [req.user?.id || null, a.id]
     );
     await conn.commit();
   } catch (err) {
     await conn.rollback().catch(() => {});
     conn.release();
-    return sendError(res, err, 'The asset could not be moved back to in use. Try again.');
+    return sendError(res, err, 'The asset could not be reinstated. Try again.');
   }
   conn.release();
-  await logAudit(req, 'UPDATE', 'assets', a.id, `Moved ${label(a)} back to in use`);
+  await logAudit(req, 'UPDATE', 'assets', a.id, `Reinstated ${label(a)}`);
   res.json(await loadAsset(db, a.id));
 });
 
